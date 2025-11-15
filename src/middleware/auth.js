@@ -1,18 +1,21 @@
 const jwt = require('jsonwebtoken');
 
 function requireAuth(req, res, next) {
-  const header = req.headers.authorization;
-  if (!header) return res.status(401).json({ error: 'missing auth header' });
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer '))
+    return res.status(401).json({ error: 'Missing or invalid token' });
 
-  const parts = header.split(' ');
-  if (parts.length !== 2 || parts[0] !== 'Bearer') return res.status(401).json({ error: 'invalid auth header' });
+  const token = authHeader.split(' ')[1];
 
   try {
-    const payload = jwt.verify(parts[1], process.env.JWT_SECRET);
-    req.user = payload;
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = { userId: payload.userId, email: payload.email };
     next();
   } catch (err) {
-    return res.status(401).json({ error: 'invalid token' });
+    if (err.name === 'TokenExpiredError') {
+      return res.status(401).json({ error: 'Token expired' });
+    }
+    return res.status(401).json({ error: 'Invalid token' });
   }
 }
 

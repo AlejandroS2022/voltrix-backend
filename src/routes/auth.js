@@ -3,13 +3,15 @@ const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const { getDb } = require('../db');
 const { requireAuth } = require('../middleware/auth');
+const { validateRegister, validateLogin } = require('../middleware/validate');
+
 const router = express.Router();
 
 const SALT_ROUNDS = parseInt(process.env.BCRYPT_SALT_ROUNDS || '10', 10);
 const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
 
-router.post('/register', async (req, res) => {
+router.post('/register', validateRegister, async (req, res) => {
   try {
     const { first_name, last_name, email, password } = req.body;
     if (!first_name || !last_name || !email || !password) {
@@ -18,7 +20,7 @@ router.post('/register', async (req, res) => {
 
     const db = getDb();
     const userCheck = await db.query('SELECT id FROM users WHERE email=$1', [email]);
-    if (userCheck.rows.length) return res.status(409).json({ error: 'email exists' });
+    if (userCheck.rows.length) return res.status(400).json({ error: 'Email already registered' });
 
     const hash = await bcrypt.hash(password, SALT_ROUNDS);
     const result = await db.query(
@@ -29,33 +31,41 @@ router.post('/register', async (req, res) => {
     );
     const user = result.rows[0];
 
-    // create wallet row
     await db.query('INSERT INTO wallets (user_id, balance_cents) VALUES ($1, 0)', [user.id]);
 
-    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
-    res.json({ token, user });
+    const token = jwt.sign(
+      { userId: user.id, email: user.email },
+      JWT_SECRET,
+      { expiresIn: JWT_EXPIRES_IN }
+    );
+
+    res.status(201).json({ token, user });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'server error' });
+    res.status(500).json({ error: 'Registration failed' });
   }
 });
 
-router.post('/login', async (req, res) => {
+router.post('/login', validateLogin, async (req, res) => {
   try {
     const { email, password } = req.body;
     const db = getDb();
-    const q = await db.query('SELECT id, email, password_hash FROM users WHERE email=$1', [email]);
-    if (!q.rows.length) return res.status(401).json({ error: 'invalid credentials' });
+    const result = await db.query('SELECT * FROM users WHERE email=$1', [email]);
+    if (!result.rows.length) return res.status(401).json({ error: 'Invalid credentials' });
 
-    const user = q.rows[0];
-    const ok = await bcrypt.compare(password, user.password_hash);
-    if (!ok) return res.status(401).json({ error: 'invalid credentials' });
+    const user = result.rows[0];
+    const valid = await bcrypt.compare(password, user.password_hash);
+    if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
 
-    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+    const token = jwt.sign(
+      { userId: user.id, email: user.email },
+      JWT_SECRET,
+      { expiresIn: JWT_EXPIRES_IN }
+    );
     res.json({ token, user });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'server error' });
+    res.status(500).json({ error: 'Login failed' });
   }
 });
 
