@@ -19,7 +19,7 @@ function setupSecurity(app) {
 
   const allowedOrigins = [
     'http://localhost:5173',
-    'https://voltrixgeneral.com/'
+    'https://voltrixgeneral.com'
   ];
   app.use(cors({
     origin: allowedOrigins,
