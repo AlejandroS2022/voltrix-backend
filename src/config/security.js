@@ -3,11 +3,14 @@ const cors = require('cors');
 const { rateLimit } = require('express-rate-limit');
 const { RedisStore } = require("rate-limit-redis");
 const RedisClient = require('ioredis')
+const redis = require('./redis')
 const xssClean = require('xss-clean');
 const compression = require('compression');
 const morgan = require('morgan');
 const { errors } = require('celebrate');
 const cookieParser = require('cookie-parser')
+
+const REDIS_URL = process.env.REDIS_URL;
 
 function setupSecurity(app) {
   app.use(helmet({
@@ -24,7 +27,7 @@ function setupSecurity(app) {
 
   app.use(xssClean());
 
-  const client = new RedisClient()
+  const client = redis;
   const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,  // 15 minutes
     max: 100,
