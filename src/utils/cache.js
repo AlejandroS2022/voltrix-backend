@@ -1,36 +1,30 @@
-const memjs = require('memjs');
+const redis = require('../config/redis')
 
-const mc = memjs.Client.create(process.env.MEMCACHED_SERVERS || 'localhost:11211', {
-  username: process.env.MEMCACHED_USER || undefined,
-  password: process.env.MEMCACHED_PASS || undefined,
-});
+const DEFAULT_TTL = 60;
 
-async function cacheSet(key, value, ttlSeconds = 60) {
+async function cacheSet(key, value, ttlSeconds = DEFAULT_TTL) {
   try {
-    await mc.set(key, JSON.stringify(value), { expires: ttlSeconds });
+    await redis.set(key, JSON.stringify(value), "EX", ttlSeconds);
   } catch (err) {
-    console.error('Memcached set error:', err);
+    console.error('Redis SET error:', err);
   }
 }
 
 async function cacheGet(key) {
   try {
-    const result = await mc.get(key);
-    if (result.value) {
-      return JSON.parse(result.value.toString());
-    }
-    return null;
+    const result = await redis.get(key);
+    return result ? JSON.parse(result) : null;
   } catch (err) {
-    console.error('Memcached get error:', err);
+    console.error('Redis GET error:', err);
     return null;
   }
 }
 
 async function cacheDelete(key) {
   try {
-    await mc.delete(key);
+    await redis.del(key);
   } catch (err) {
-    console.error('Memcached delete error:', err);
+    console.error('Redis DELETE error:', err);
   }
 }
 

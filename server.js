@@ -7,7 +7,6 @@ const { initDb } = require('./src/db');
 const authRoutes = require('./src/routes/auth');
 const tradingRoutes = require('./src/routes/trading');
 const { setupSocket } = require('./src/socket');
-const { errors } = require('celebrate');
 
 const app = express();
 const server = http.createServer(app);
@@ -19,14 +18,6 @@ app.use(express.json());
 app.use('/api/auth', authRoutes);
 app.use('/api/trade', tradingRoutes);
 
-app.use(errors());
-
-app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
-  res.status(500).json({ error: 'Internal server error' });
-});
-
-// init DB then start
 (async () => {
   try {
     await initDb();

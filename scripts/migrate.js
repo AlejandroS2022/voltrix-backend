@@ -48,6 +48,7 @@ async function migrate() {
     side VARCHAR(10) NOT NULL,
     price_cents BIGINT NOT NULL,
     size NUMERIC NOT NULL,
+    symbol VARCHAR(32) DEFAULT 'BTCUSD',
     status VARCHAR(20) NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
   );
@@ -58,7 +59,39 @@ async function migrate() {
     sell_order_id INTEGER REFERENCES orders(id),
     price_cents BIGINT NOT NULL,
     size NUMERIC NOT NULL,
+    symbol VARCHAR(32) DEFAULT 'BTCUSD',
     executed_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+  );
+
+  CREATE TABLE IF NOT EXISTS refresh_tokens (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL,
+    user_agent TEXT,
+    ip_address TEXT,
+    revoked BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    expires_at TIMESTAMPTZ NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS ledger (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    related_order_id INTEGER,
+    change_cents BIGINT NOT NULL,
+    balance_before BIGINT NOT NULL,
+    balance_after BIGINT NOT NULL,
+    type VARCHAR(50) NOT NULL, -- deposit, withdraw, reserve, release, trade_in, trade_out, fee
+    meta JSONB,
+    created_at TIMESTAMPTZ DEFAULT now()
+  );
+
+  CREATE TABLE IF NOT EXISTS holds (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    order_id INTEGER REFERENCES orders(id) ON DELETE CASCADE,
+    amount_cents BIGINT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now()
   );
   `;
   try {
