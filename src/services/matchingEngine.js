@@ -2,238 +2,96 @@ const { getDb } = require('../db');
 const { broadcastTrade } = require('../socket');
 const { v4: uuidv4 } = require('uuid');
 
-async function placeOrder({ userId, side, price_cents, size, symbol = 'BTCUSD' }) {
-  // size is numeric (units), price_cents is integer
+async function placeOrder({ userId, side, order_type = 'limit', price_cents = null, size, stop_loss_cents = null, take_profit_cents = null, symbol = 'BTCUSD' }) {
+  // size is numeric (units), price_cents is integer for limit orders; market orders have price_cents == null
   const db = getDb();
   const client = await db.connect();
 
   try {
     await client.query('BEGIN');
 
-    // 1) Insert order
-    const insertRes = await client.query(
-      `INSERT INTO orders (user_id, side, price_cents, size, status, created_at, symbol)
-       VALUES ($1,$2,$3,$4,'open',NOW(),$5) RETURNING *`,
-      [userId, side, price_cents, size, symbol]
-    );
-    let remainingSize = parseFloat(insertRes.rows[0].size);
-    const orderId = insertRes.rows[0].id;
+    // No orders table in position model: we will create positions directly.
+    let remainingSize = Number(size);
+    const orderId = null;
 
-    // 2) If BUY: reserve funds (price * size)
-    if (side === 'buy') {
-      const costCents = Math.ceil(price_cents * remainingSize); // ensure cents
-      // lock wallet row
+    // In position model, we'll create a position when an order executes. For limit orders that don't execute immediately,
+    // we leave the order open. For market orders (or limit orders that match current price) we create a position and debit wallet.
+
+    // Helper to fetch last trade price
+    async function getLastPrice() {
+      const pQ = await client.query('SELECT price_cents FROM trades WHERE symbol=$1 ORDER BY executed_at DESC LIMIT 1', [symbol]);
+      if (pQ.rowCount) return pQ.rows[0].price_cents;
+      return null;
+    }
+
+    async function openPosition(entryPriceCents, placedPriceCents = null) {
+      // 1) create position record
+      const posRes = await client.query(
+        `INSERT INTO positions (user_id, symbol, side, size, entry_price_cents, placed_price_cents, stop_loss_cents, take_profit_cents, order_type, status, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'open',NOW()) RETURNING *`,
+        [userId, symbol, side, size, entryPriceCents, placedPriceCents, stop_loss_cents, take_profit_cents, order_type]
+      );
+      const position = posRes.rows[0];
+
+      // 2) charge user: deduct entry_price * size from wallet
+      const entryAmount = Math.ceil(entryPriceCents * Number(size));
       const wq = await client.query('SELECT balance_cents FROM wallets WHERE user_id=$1 FOR UPDATE', [userId]);
       const balance = BigInt(wq.rows[0]?.balance_cents || 0);
-      const cost = BigInt(costCents);
+      const cost = BigInt(entryAmount);
       if (balance < cost) {
+        // remove created position record
+        await client.query('DELETE FROM positions WHERE id=$1', [position.id]);
         await client.query('ROLLBACK');
         return { error: 'insufficient_funds' };
       }
       const balanceBefore = balance;
       const balanceAfter = balance - cost;
-      await client.query('UPDATE wallets SET balance_cents = $1 WHERE user_id=$2', [balanceAfter.toString(), userId]);
-      await client.query('INSERT INTO holds (user_id, order_id, amount_cents) VALUES ($1,$2,$3)', [userId, orderId, costCents]);
-
-      // ledger
+      await client.query('UPDATE wallets SET balance_cents=$1 WHERE user_id=$2', [balanceAfter.toString(), userId]);
       await client.query(
         `INSERT INTO ledger (user_id, related_order_id, change_cents, balance_before, balance_after, type, meta)
          VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-        [userId, orderId, -costCents, balanceBefore.toString(), balanceAfter.toString(), 'reserve', JSON.stringify({ symbol, price_cents })]
-      );
-    }
-
-    // 3) Match loop: find best opposite orders and execute trades until remainingSize == 0 or nothing to match
-    while (remainingSize > 0) {
-      let matchQuery;
-      if (side === 'buy') {
-        // find lowest price sell order <= buy price
-        matchQuery = `
-          SELECT id, user_id, price_cents, size FROM orders
-          WHERE side='sell' AND status='open' AND symbol=$1 AND price_cents <= $2
-          ORDER BY price_cents ASC, created_at ASC
-          FOR UPDATE SKIP LOCKED
-          LIMIT 1
-        `;
-      } else {
-        matchQuery = `
-          SELECT id, user_id, price_cents, size FROM orders
-          WHERE side='buy' AND status='open' AND symbol=$1 AND price_cents >= $2
-          ORDER BY price_cents DESC, created_at ASC
-          FOR UPDATE SKIP LOCKED
-          LIMIT 1
-        `;
-      }
-
-      const mq = await client.query(matchQuery, [symbol, price_cents]);
-      if (mq.rowCount === 0) break; // nothing to match
-
-      const matchOrder = mq.rows[0];
-      const matchSize = parseFloat(matchOrder.size);
-      const executedSize = Math.min(remainingSize, matchSize);
-      const tradePrice = matchOrder.price_cents; // taker accepts maker price (match price)
-
-      // create trade record
-      await client.query(
-        `INSERT INTO trades (buy_order_id, sell_order_id, price_cents, size, executed_at, symbol)
-         VALUES ($1,$2,$3,$4,NOW(),$5)`,
-        [
-          side === 'buy' ? orderId : matchOrder.id,
-          side === 'buy' ? matchOrder.id : orderId,
-          tradePrice,
-          executedSize,
-          symbol
-        ]
+        [userId, null, -entryAmount, balanceBefore.toString(), balanceAfter.toString(), 'position_open', JSON.stringify({ position_id: position.id, symbol, entry_price_cents: entryPriceCents })]
       );
 
-      // ledger updates & wallet transfers
-      // Buyer: funds already reserved in holds (if buyer is current order and side==='buy', else if buyer is matchOrder user must deduct now)
-      const tradeAmountCents = Math.ceil(tradePrice * executedSize);
+      // position opened; nothing to mark on orders since orders are removed
+      return { ok: true, positionId: position.id };
+    }
 
-      // ensure numeric bigints for DB
-      // For buyer:
-      if (side === 'buy') {
-        // buyer = userId (current order) — reserved funds exist
-        // release portion of hold and keep the spent amount removed from hold
-        // Reduce hold amount by tradeAmountCents
-        const holdRow = await client.query('SELECT id, amount_cents FROM holds WHERE order_id=$1 FOR UPDATE', [orderId]);
-        if (holdRow.rowCount) {
-          const currentHold = BigInt(holdRow.rows[0].amount_cents);
-          const newHold = currentHold - BigInt(tradeAmountCents);
-          if (newHold < 0n) {
-            // shouldn't happen: just keepng for safety
-            await client.query('ROLLBACK');
-            throw new Error('Hold underflow');
-          }
-          if (newHold === 0n) {
-            await client.query('DELETE FROM holds WHERE id=$1', [holdRow.rows[0].id]);
-          } else {
-            await client.query('UPDATE holds SET amount_cents=$1 WHERE id=$2', [newHold.toString(), holdRow.rows[0].id]);
-          }
-        } else {
-          // maybe buyer was maker (matchOrder) otherwise handle
-        }
-
-        // Credit seller wallet
-        const sellerWalletBeforeQ = await client.query('SELECT balance_cents FROM wallets WHERE user_id=$1 FOR UPDATE', [matchOrder.user_id]);
-        const sellerBefore = BigInt(sellerWalletBeforeQ.rows[0]?.balance_cents || 0);
-        const sellerAfter = sellerBefore + BigInt(tradeAmountCents);
-        await client.query('UPDATE wallets SET balance_cents=$1 WHERE user_id=$2', [sellerAfter.toString(), matchOrder.user_id]);
-
-        // ledger entries
-        await client.query(
-          `INSERT INTO ledger (user_id, related_order_id, change_cents, balance_before, balance_after, type, meta)
-           VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-          [matchOrder.user_id, matchOrder.id, tradeAmountCents, sellerBefore.toString(), sellerAfter.toString(), 'trade_in', JSON.stringify({ from: userId, symbol })]
+    // Decide execution for market orders or immediate limit fills
+    // normalize symbol to uppercase
+    symbol = (symbol || 'BTCUSD').toUpperCase();
+    const lastPrice = await getLastPrice();
+    // Broker order placement disabled: execute locally within platform using last known price or pending logic
+    if (order_type === 'market') {
+      if (!lastPrice) {
+        await client.query('ROLLBACK');
+        return { error: 'no_price_available' };
+      }
+      // Open position at lastPrice
+      const res = await openPosition(lastPrice, lastPrice);
+      if (res.error) return res;
+      await client.query('COMMIT');
+      return res;
+    } else {
+      // limit: if price crosses lastPrice then execute immediately, otherwise keep order open
+      if (lastPrice && ((side === 'buy' && lastPrice <= price_cents) || (side === 'sell' && lastPrice >= price_cents))) {
+        const res = await openPosition(price_cents);
+        if (res.error) return res;
+        await client.query('COMMIT');
+        return res;
+      } else {
+        // create a pending position that will be activated when price reaches entry (external worker needed)
+        const pending = await client.query(
+          `INSERT INTO positions (user_id, symbol, side, size, entry_price_cents, placed_price_cents, stop_loss_cents, take_profit_cents, order_type, status, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',NOW()) RETURNING *`,
+          [userId, symbol, side, size, price_cents, lastPrice, stop_loss_cents, take_profit_cents, order_type]
         );
-      } else {
-        // side === 'sell' (current order is seller)
-        // Buyer is matchOrder.user_id — they likely reserved funds or have wallet funds
-        // For buyer (matchOrder.user_id): deduct funds now (if reserved earlier, reduce their hold)
-        const buyerId = matchOrder.user_id;
-        // attempt to reduce buy order's hold
-        const buyerHoldQ = await client.query('SELECT id, amount_cents, order_id FROM holds WHERE order_id=$1 FOR UPDATE', [matchOrder.id]);
-        if (buyerHoldQ.rowCount) {
-          const holdRow = buyerHoldQ.rows[0];
-          const currentHold = BigInt(holdRow.amount_cents);
-          const newHold = currentHold - BigInt(tradeAmountCents);
-          if (newHold < 0n) {
-            await client.query('ROLLBACK');
-            throw new Error('Buyer hold underflow');
-          }
-          if (newHold === 0n) {
-            await client.query('DELETE FROM holds WHERE id=$1', [holdRow.id]);
-          } else {
-            await client.query('UPDATE holds SET amount_cents=$1 WHERE id=$2', [newHold.toString(), holdRow.id]);
-          }
-        } else {
-          // if no hold found, attempt to deduct directly (should be rare)
-          const wq = await client.query('SELECT balance_cents FROM wallets WHERE user_id=$1 FOR UPDATE', [buyerId]);
-          const before = BigInt(wq.rows[0]?.balance_cents || 0);
-          if (before < BigInt(tradeAmountCents)) {
-            await client.query('ROLLBACK');
-            return { error: 'buyer_insufficient_after_attempt' };
-          }
-          const after = before - BigInt(tradeAmountCents);
-          await client.query('UPDATE wallets SET balance_cents=$1 WHERE user_id=$2', [after.toString(), buyerId]);
-          await client.query(
-            `INSERT INTO ledger (user_id, related_order_id, change_cents, balance_before, balance_after, type, meta)
-             VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-            [buyerId, matchOrder.id, -tradeAmountCents, before.toString(), after.toString(), 'trade_out', JSON.stringify({ to: userId, symbol })]
-          );
-        }
-
-        // Credit seller (current user)
-        const sellerWq = await client.query('SELECT balance_cents FROM wallets WHERE user_id=$1 FOR UPDATE', [userId]);
-        const sellerBefore = BigInt(sellerWq.rows[0]?.balance_cents || 0);
-        const sellerAfter = sellerBefore + BigInt(tradeAmountCents);
-        await client.query('UPDATE wallets SET balance_cents=$1 WHERE user_id=$2', [sellerAfter.toString(), userId]);
-        await client.query(
-          `INSERT INTO ledger (user_id, related_order_id, change_cents, balance_before, balance_after, type, meta)
-           VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-          [userId, orderId, tradeAmountCents, sellerBefore.toString(), sellerAfter.toString(), 'trade_in', JSON.stringify({ from: buyerId, symbol })]
-        );
-      }
-
-      // 4) adjust matched order sizes and statuses
-      const newMatchRemaining = parseFloat(matchSize) - executedSize;
-      if (newMatchRemaining <= 0) {
-        await client.query(`UPDATE orders SET status='filled', size=0 WHERE id=$1`, [matchOrder.id]);
-      } else {
-        await client.query(`UPDATE orders SET size=$1 WHERE id=$2`, [newMatchRemaining, matchOrder.id]);
-      }
-
-      remainingSize = remainingSize - executedSize;
-      const newOrderRemaining = remainingSize;
-      if (newOrderRemaining <= 0) {
-        await client.query(`UPDATE orders SET status='filled', size=0 WHERE id=$1`, [orderId]);
-      } else {
-        await client.query(`UPDATE orders SET size=$1 WHERE id=$2`, [newOrderRemaining, orderId]);
-      }
-
-      // Broadcast trade to sockets
-      const tradeMsg = {
-        symbol,
-        price_cents: tradePrice,
-        size: executedSize,
-        buy_order_id: side === 'buy' ? orderId : matchOrder.id,
-        sell_order_id: side === 'buy' ? matchOrder.id : orderId,
-        ts: Date.now()
-      };
-      broadcastTrade(tradeMsg);
-      // continue loop for remaining size
-    } // end match loop
-
-    // 4) If buy order still has remaining size, adjust holds to only reserve remaining amount
-    if (side === 'buy') {
-      // compute reserved vs necessary
-      const holdQ = await client.query('SELECT id, amount_cents FROM holds WHERE order_id=$1 FOR UPDATE', [orderId]);
-      if (holdQ.rowCount) {
-        const holdRow = holdQ.rows[0];
-        // desired reserved amount = remainingSize * price_cents
-        const desiredReserve = Math.ceil(price_cents * remainingSize);
-        const currentReserve = BigInt(holdRow.amount_cents);
-        const desiredReserveB = BigInt(desiredReserve);
-        if (desiredReserveB < currentReserve) {
-          const diff = currentReserve - desiredReserveB;
-          // release diff back to wallet
-          const wq = await client.query('SELECT balance_cents FROM wallets WHERE user_id=$1 FOR UPDATE', [userId]);
-          const before = BigInt(wq.rows[0]?.balance_cents || 0);
-          const after = before + diff;
-          await client.query('UPDATE wallets SET balance_cents=$1 WHERE user_id=$2', [after.toString(), userId]);
-          if (desiredReserveB === 0n) {
-            await client.query('DELETE FROM holds WHERE id=$1', [holdRow.id]);
-          } else {
-            await client.query('UPDATE holds SET amount_cents=$1 WHERE id=$2', [desiredReserve.toString(), holdRow.id]);
-          }
-          await client.query(
-            `INSERT INTO ledger (user_id, related_order_id, change_cents, balance_before, balance_after, type, meta)
-             VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-            [userId, orderId, Number(diff * 1n), before.toString(), after.toString(), 'release', JSON.stringify({ symbol })]
-          );
-        }
+        await client.query('COMMIT');
+        return { ok: true, pending: true, positionId: pending.rows[0].id };
       }
     }
+
+    // No holds logic in simple position model; funds are captured on openPosition
 
     await client.query('COMMIT');
     return { ok: true, orderId, remaining: remainingSize };
@@ -246,4 +104,146 @@ async function placeOrder({ userId, side, price_cents, size, symbol = 'BTCUSD' }
   }
 }
 
-module.exports = { placeOrder };
+async function closePosition({ positionId, closePriceCents = null }) {
+  const db = getDb();
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const pq = await client.query('SELECT * FROM positions WHERE id=$1 FOR UPDATE', [positionId]);
+    if (pq.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return { error: 'position_not_found' };
+    }
+    const pos = pq.rows[0];
+    if (pos.status !== 'open') {
+      await client.query('ROLLBACK');
+      return { error: 'position_not_open' };
+    }
+
+    // determine close price
+    let closePrice = closePriceCents;
+    if (closePrice === null || closePrice === undefined) {
+      const lp = await client.query('SELECT price_cents FROM trades WHERE symbol=$1 ORDER BY executed_at DESC LIMIT 1', [pos.symbol]);
+      if (lp.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return { error: 'no_price_available' };
+      }
+      closePrice = lp.rows[0].price_cents;
+    }
+
+    const entryPrice = Number(pos.entry_price_cents);
+    const sizeNum = Number(pos.size);
+    const entryAmount = BigInt(Math.ceil(entryPrice * sizeNum));
+    const closeAmount = BigInt(Math.ceil(closePrice * sizeNum));
+    const pnl = closeAmount - entryAmount;
+
+    // credit user wallet with closeAmount
+    const wq = await client.query('SELECT balance_cents FROM wallets WHERE user_id=$1 FOR UPDATE', [pos.user_id]);
+    const before = BigInt(wq.rows[0]?.balance_cents || 0);
+    const after = before + closeAmount;
+    await client.query('UPDATE wallets SET balance_cents=$1 WHERE user_id=$2', [after.toString(), pos.user_id]);
+
+    // ledger entry
+    await client.query(
+      `INSERT INTO ledger (user_id, related_order_id, change_cents, balance_before, balance_after, type, meta)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [pos.user_id, null, Number(closeAmount), before.toString(), after.toString(), 'position_close', JSON.stringify({ position_id: pos.id, close_price_cents: closePrice })]
+    );
+
+    // update position
+    await client.query('UPDATE positions SET status=$1, closed_at=NOW(), close_price_cents=$2, realized_pnl_cents=$3 WHERE id=$4', ['closed', closePrice, Number(pnl), pos.id]);
+
+    // insert a trade record for the close (no counterparty)
+    await client.query(
+      `INSERT INTO trades (buy_order_id, sell_order_id, price_cents, size, executed_at, symbol)
+       VALUES ($1,$2,$3,$4,NOW(),$5)`,
+      [null, null, closePrice, sizeNum, pos.symbol]
+    );
+
+    await client.query('COMMIT');
+    return { ok: true, positionId: pos.id, pnl: Number(pnl) };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('closePosition error', err);
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// compatibility wrapper: allow either placeOrder({ ... }) or placeOrder(userId, side, price_cents, size, symbol)
+async function placeOrderCompat(...args) {
+  if (args.length === 1 && typeof args[0] === 'object') {
+    return placeOrder(args[0]);
+  }
+  // positional signature (legacy): userId, side, price_cents, size, symbol
+  const [userId, side, price_cents, size, symbol] = args;
+  return placeOrder({ userId, side, order_type: 'limit', price_cents, size, symbol });
+}
+
+module.exports = { placeOrder: placeOrderCompat, closePosition };
+
+async function activatePendingPosition({ positionId, marketPriceCents }) {
+  const db = getDb();
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const pq = await client.query('SELECT * FROM positions WHERE id=$1 FOR UPDATE', [positionId]);
+    if (pq.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return { error: 'position_not_found' };
+    }
+    const pos = pq.rows[0];
+    if (pos.status !== 'pending') {
+      await client.query('ROLLBACK');
+      return { error: 'position_not_pending' };
+    }
+
+    const entryPrice = Number(pos.entry_price_cents);
+    const execPrice = marketPriceCents || entryPrice;
+    const sizeNum = Number(pos.size);
+    const entryAmount = BigInt(Math.ceil(execPrice * sizeNum));
+
+    // charge user
+    const wq = await client.query('SELECT balance_cents FROM wallets WHERE user_id=$1 FOR UPDATE', [pos.user_id]);
+    const balance = BigInt(wq.rows[0]?.balance_cents || 0);
+    if (balance < entryAmount) {
+      // mark pending as cancelled due to insufficient funds
+      await client.query("UPDATE positions SET status=$1 WHERE id=$2", ['cancelled', pos.id]);
+      await client.query('COMMIT');
+      return { error: 'insufficient_funds' };
+    }
+
+    const balanceBefore = balance;
+    const balanceAfter = balance - entryAmount;
+    await client.query('UPDATE wallets SET balance_cents=$1 WHERE user_id=$2', [balanceAfter.toString(), pos.user_id]);
+
+    await client.query(
+      `INSERT INTO ledger (user_id, related_order_id, change_cents, balance_before, balance_after, type, meta)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [pos.user_id, null, -Number(entryAmount), balanceBefore.toString(), balanceAfter.toString(), 'position_open', JSON.stringify({ position_id: pos.id, symbol: pos.symbol, entry_price_cents: execPrice })]
+    );
+
+    // update position to open and set actual entry price
+    await client.query('UPDATE positions SET status=$1, entry_price_cents=$2, created_at=COALESCE(created_at,NOW()) WHERE id=$3', ['open', execPrice, pos.id]);
+
+    // record a trade for the open (no counterparty)
+    await client.query(
+      `INSERT INTO trades (buy_order_id, sell_order_id, price_cents, size, executed_at, symbol)
+       VALUES ($1,$2,$3,$4,NOW(),$5)`,
+      [null, null, execPrice, sizeNum, pos.symbol]
+    );
+
+    await client.query('COMMIT');
+    return { ok: true, positionId: pos.id };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('activatePendingPosition error', err);
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// export activation helper
+module.exports.activatePendingPosition = activatePendingPosition;

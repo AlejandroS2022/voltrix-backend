@@ -1,5 +1,6 @@
 const express = require('express');
 const bcrypt = require('bcrypt');
+const axios = require('axios');
 const { getDb } = require('../db');
 const { validateRegister, validateLogin } = require('../middleware/validate');
 const { generateAccessToken, generateRefreshToken, hashToken } = require('../utils/tokens');
@@ -147,6 +148,146 @@ router.post('/logout', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Logout failed' });
+  }
+});
+
+// OAuth2 quick-start endpoints (redirects). These are optional helpers —
+// to enable fully working social login configure the provider client IDs/secrets
+// in env and implement the callback exchange. For now these routes redirect
+// to the provider consent URL when CLIENT_ID is present, otherwise return 501.
+
+router.get('/oauth/google', (req, res) => {
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  const redirectUri = process.env.GOOGLE_OAUTH_CALLBACK;
+  if (!clientId || !redirectUri) return res.status(501).json({ error: 'Google OAuth not configured. Set GOOGLE_CLIENT_ID and GOOGLE_OAUTH_CALLBACK.' });
+  const scope = encodeURIComponent('openid email profile');
+  const state = encodeURIComponent(req.query.state || '/');
+  const url = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=${scope}&state=${state}`;
+  res.redirect(url);
+});
+
+router.get('/oauth/google/callback', async (req, res) => {
+  const code = req.query.code;
+  const state = decodeURIComponent(req.query.state || '/');
+  if (!code) return res.status(400).json({ error: 'missing_code' });
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+  const redirectUri = process.env.GOOGLE_OAUTH_CALLBACK;
+  if (!clientId || !clientSecret || !redirectUri) return res.status(501).json({ error: 'Google OAuth not configured' });
+
+  try {
+    // Exchange code for tokens
+    const params = new URLSearchParams();
+    params.append('code', code);
+    params.append('client_id', clientId);
+    params.append('client_secret', clientSecret);
+    params.append('redirect_uri', redirectUri);
+    params.append('grant_type', 'authorization_code');
+
+    const tokenRes = await axios.post('https://oauth2.googleapis.com/token', params.toString(), { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
+    const accessToken = tokenRes.data.access_token;
+    if (!accessToken) return res.status(502).json({ error: 'token_exchange_failed' });
+
+    // Fetch user info
+    const userRes = await axios.get(`https://www.googleapis.com/oauth2/v2/userinfo?access_token=${accessToken}`);
+    const profile = userRes.data || {};
+    if (!profile.email) return res.status(400).json({ error: 'email_required' });
+
+    const db = getDb();
+    let user;
+    const existing = await db.query('SELECT id,email,first_name,last_name FROM users WHERE email=$1', [profile.email]);
+    if (existing.rowCount) {
+      user = existing.rows[0];
+      // optionally update names
+      await db.query('UPDATE users SET first_name=$1, last_name=$2 WHERE id=$3', [profile.given_name || user.first_name, profile.family_name || user.last_name, user.id]);
+    } else {
+      const r = await db.query(
+        `INSERT INTO users (email, first_name, last_name, created_at) VALUES ($1,$2,$3,NOW()) RETURNING id,email,first_name,last_name`,
+        [profile.email, profile.given_name || '', profile.family_name || '']
+      );
+      user = r.rows[0];
+      await db.query('INSERT INTO wallets (user_id, balance_cents) VALUES ($1,0) ON CONFLICT DO NOTHING', [user.id]);
+    }
+
+    // create tokens (rotate refresh token logic similar to login)
+    const accessTokenLocal = generateAccessToken({ userId: user.id, email: user.email });
+    const rawRefresh = generateRefreshToken();
+    const refreshHash = hashToken(rawRefresh);
+    const expiresAt = new Date(Date.now() + REFRESH_TTL_DAYS * 24 * 3600 * 1000);
+    await db.query(`INSERT INTO refresh_tokens (user_id, token_hash, user_agent, ip_address, expires_at) VALUES ($1,$2,$3,$4,$5)`, [user.id, refreshHash, req.get('User-Agent') || null, req.ip || null, expiresAt]);
+    setRefreshCookie(res, rawRefresh, REFRESH_TTL_DAYS * 24 * 3600);
+
+    // Redirect back to frontend (state) — frontend should call /api/auth/refresh to get access token
+    const frontend = process.env.FRONTEND_URL || '/';
+    const redirectTo = `${frontend}${state.startsWith('/') ? state : '/' + state}`;
+    return res.redirect(302, redirectTo);
+  } catch (err) {
+    console.error('google oauth callback error', err && err.response ? err.response.data : err);
+    return res.status(500).json({ error: 'google_oauth_failed' });
+  }
+});
+
+router.get('/oauth/facebook', (req, res) => {
+  const clientId = process.env.FACEBOOK_CLIENT_ID;
+  const redirectUri = process.env.FACEBOOK_OAUTH_CALLBACK;
+  if (!clientId || !redirectUri) return res.status(501).json({ error: 'Facebook OAuth not configured. Set FACEBOOK_CLIENT_ID and FACEBOOK_OAUTH_CALLBACK.' });
+  const scope = encodeURIComponent('email public_profile');
+  const state = encodeURIComponent(req.query.state || '/');
+  const url = `https://www.facebook.com/v16.0/dialog/oauth?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${state}&scope=${scope}`;
+  res.redirect(url);
+});
+
+router.get('/oauth/facebook/callback', async (req, res) => {
+  const code = req.query.code;
+  const state = decodeURIComponent(req.query.state || '/');
+  if (!code) return res.status(400).json({ error: 'missing_code' });
+  const clientId = process.env.FACEBOOK_CLIENT_ID;
+  const clientSecret = process.env.FACEBOOK_CLIENT_SECRET;
+  const redirectUri = process.env.FACEBOOK_OAUTH_CALLBACK;
+  if (!clientId || !clientSecret || !redirectUri) return res.status(501).json({ error: 'Facebook OAuth not configured' });
+
+  try {
+    // Exchange code for access token
+    const tokenUrl = `https://graph.facebook.com/v16.0/oauth/access_token?client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&client_secret=${encodeURIComponent(clientSecret)}&code=${encodeURIComponent(code)}`;
+    const tokenRes = await axios.get(tokenUrl);
+    const accessToken = tokenRes.data.access_token;
+    if (!accessToken) return res.status(502).json({ error: 'token_exchange_failed' });
+
+    // Fetch profile
+    const profileUrl = `https://graph.facebook.com/me?fields=id,email,first_name,last_name&access_token=${encodeURIComponent(accessToken)}`;
+    const profileRes = await axios.get(profileUrl);
+    const profile = profileRes.data || {};
+    if (!profile.email) return res.status(400).json({ error: 'email_required' });
+
+    const db = getDb();
+    let user;
+    const existing = await db.query('SELECT id,email,first_name,last_name FROM users WHERE email=$1', [profile.email]);
+    if (existing.rowCount) {
+      user = existing.rows[0];
+      await db.query('UPDATE users SET first_name=$1, last_name=$2 WHERE id=$3', [profile.first_name || user.first_name, profile.last_name || user.last_name, user.id]);
+    } else {
+      const r = await db.query(
+        `INSERT INTO users (email, first_name, last_name, created_at) VALUES ($1,$2,$3,NOW()) RETURNING id,email,first_name,last_name`,
+        [profile.email, profile.first_name || '', profile.last_name || '']
+      );
+      user = r.rows[0];
+      await db.query('INSERT INTO wallets (user_id, balance_cents) VALUES ($1,0) ON CONFLICT DO NOTHING', [user.id]);
+    }
+
+    // create tokens
+    const accessTokenLocal = generateAccessToken({ userId: user.id, email: user.email });
+    const rawRefresh = generateRefreshToken();
+    const refreshHash = hashToken(rawRefresh);
+    const expiresAt = new Date(Date.now() + REFRESH_TTL_DAYS * 24 * 3600 * 1000);
+    await db.query(`INSERT INTO refresh_tokens (user_id, token_hash, user_agent, ip_address, expires_at) VALUES ($1,$2,$3,$4,$5)`, [user.id, refreshHash, req.get('User-Agent') || null, req.ip || null, expiresAt]);
+    setRefreshCookie(res, rawRefresh, REFRESH_TTL_DAYS * 24 * 3600);
+
+    const frontend = process.env.FRONTEND_URL || '/';
+    const redirectTo = `${frontend}${state.startsWith('/') ? state : '/' + state}`;
+    return res.redirect(302, redirectTo);
+  } catch (err) {
+    console.error('facebook oauth callback error', err && err.response ? err.response.data : err);
+    return res.status(500).json({ error: 'facebook_oauth_failed' });
   }
 });
 

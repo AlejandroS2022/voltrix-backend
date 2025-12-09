@@ -46,12 +46,72 @@ async function migrate() {
     id SERIAL PRIMARY KEY,
     user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
     side VARCHAR(10) NOT NULL,
-    price_cents BIGINT NOT NULL,
+    price_cents BIGINT,
     size NUMERIC NOT NULL,
     symbol VARCHAR(32) DEFAULT 'BTCUSD',
     status VARCHAR(20) NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
   );
+
+  CREATE TABLE IF NOT EXISTS positions (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    symbol VARCHAR(32) NOT NULL,
+    side VARCHAR(10) NOT NULL,
+    size NUMERIC NOT NULL,
+    entry_price_cents BIGINT NOT NULL,
+    stop_loss_cents BIGINT,
+    take_profit_cents BIGINT,
+    order_type VARCHAR(20) DEFAULT 'market',
+    status VARCHAR(20) DEFAULT 'open',
+    realized_pnl_cents BIGINT DEFAULT 0,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+    closed_at TIMESTAMP WITH TIME ZONE,
+    close_price_cents BIGINT
+  );
+
+  -- Add order-type fields and risk levels (stop loss / take profit) if missing
+  ALTER TABLE orders ALTER COLUMN price_cents DROP NOT NULL;
+  DO $$
+  BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='orders' AND column_name='order_type') THEN
+      ALTER TABLE orders ADD COLUMN order_type VARCHAR(20) DEFAULT 'limit';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='orders' AND column_name='stop_loss_cents') THEN
+      ALTER TABLE orders ADD COLUMN stop_loss_cents BIGINT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='orders' AND column_name='take_profit_cents') THEN
+      ALTER TABLE orders ADD COLUMN take_profit_cents BIGINT;
+    END IF;
+  END$$;
+
+  -- ensure positions have order_type, stop_loss, take_profit columns
+  DO $$
+  BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='positions' AND column_name='order_type') THEN
+      ALTER TABLE positions ADD COLUMN order_type VARCHAR(20) DEFAULT 'market';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='positions' AND column_name='stop_loss_cents') THEN
+      ALTER TABLE positions ADD COLUMN stop_loss_cents BIGINT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='positions' AND column_name='take_profit_cents') THEN
+      ALTER TABLE positions ADD COLUMN take_profit_cents BIGINT;
+    END IF;
+    -- ensure we store the market price at placement time
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='positions' AND column_name='placed_price_cents') THEN
+      ALTER TABLE positions ADD COLUMN placed_price_cents BIGINT;
+    END IF;
+    -- remove broker_order_id and index if present (we no longer place orders on broker)
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='positions' AND column_name='broker_order_id') THEN
+      ALTER TABLE positions DROP COLUMN broker_order_id;
+    END IF;
+  END$$;
+  -- drop index if exists (cleanup)
+  DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relname='idx_positions_broker_order_id') THEN
+      EXECUTE 'DROP INDEX idx_positions_broker_order_id';
+    END IF;
+  END$$;
 
   CREATE TABLE IF NOT EXISTS trades (
     id SERIAL PRIMARY KEY,
@@ -93,6 +153,35 @@ async function migrate() {
     amount_cents BIGINT NOT NULL,
     created_at TIMESTAMPTZ DEFAULT now()
   );
+
+  -- KYC submissions table
+  CREATE TABLE IF NOT EXISTS kyc_submissions (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    full_name TEXT NOT NULL,
+    id_number TEXT NOT NULL,
+    document_url TEXT,
+    status VARCHAR(32) DEFAULT 'pending', -- pending/approved/rejected
+    created_at TIMESTAMPTZ DEFAULT now()
+  );
+
+  -- Symbol-specific fee table
+  CREATE TABLE IF NOT EXISTS symbol_fees (
+    id SERIAL PRIMARY KEY,
+    symbol VARCHAR(32) UNIQUE NOT NULL,
+    fee_type VARCHAR(16) NOT NULL DEFAULT 'percent', -- percent | fixed
+    fee_value NUMERIC NOT NULL DEFAULT 0, -- percent (e.g., 0.1) or fixed cents if fee_type='fixed'
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now()
+  );
+
+  -- allow marking users as admins
+  DO $$
+  BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='is_admin') THEN
+      ALTER TABLE users ADD COLUMN is_admin BOOLEAN DEFAULT FALSE;
+    END IF;
+  END$$;
   `;
   try {
     await client.query(sql);

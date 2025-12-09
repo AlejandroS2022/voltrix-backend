@@ -19,8 +19,13 @@ const validateLogin = celebrate({
 const validateOrder = celebrate({
   [Segments.BODY]: Joi.object().keys({
     side: Joi.string().valid('buy', 'sell').required(),
-    price_cents: Joi.number().integer().positive().required(),
+    order_type: Joi.string().valid('market', 'limit').default('limit'),
+    symbol: Joi.string().max(32).default('BTCUSD'),
+    // price required for limit orders
+    price_cents: Joi.when('order_type', { is: 'limit', then: Joi.number().integer().positive().required(), otherwise: Joi.number().integer().positive().optional() }),
     size: Joi.number().positive().required(),
+    stop_loss_cents: Joi.number().integer().positive().optional(),
+    take_profit_cents: Joi.number().integer().positive().optional(),
   }),
 });
 

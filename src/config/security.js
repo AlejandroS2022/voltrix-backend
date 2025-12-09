@@ -44,8 +44,6 @@ function setupSecurity(app) {
 
   app.use(morgan('dev'));
 
-  app.use(errors());
-
   app.use(cookieParser());
 }
 

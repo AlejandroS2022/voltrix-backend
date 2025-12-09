@@ -31,8 +31,20 @@ function setupSocket(httpServer) {
 // Broadcast helper (used by matchingEngine)
 function broadcastTrade(trade) {
   if (!ioInstance) return;
-  const symbol = 'BTCUSD';
+  const symbol = 'BTCUSDT';
   ioInstance.to(`asset:${symbol}`).emit('trade', trade);
 }
 
-module.exports = { setupSocket, broadcastTrade };
+function broadcastPrice(price) {
+  if (!ioInstance) return;
+  const symbol = price.symbol || 'BTCUSDT';
+  ioInstance.to(`asset:${symbol}`).emit('price', price);
+}
+
+function broadcastCandle(candle) {
+  if (!ioInstance) return;
+  const symbol = candle.symbol || 'BTCUSDT';
+  ioInstance.to(`asset:${symbol}`).emit('candle', candle);
+}
+
+module.exports = { setupSocket, broadcastTrade, broadcastPrice, broadcastCandle };
