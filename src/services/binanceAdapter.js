@@ -3,7 +3,7 @@ const EventEmitter = require('events');
 const redis = require('../config/redis');
 
 const EMIT_CHANNEL = 'market:prices';
-const BINANCE_FUTURES_WS = 'wss://fstream.binance.com/stream';
+const BINANCE_FUTURES_WS = 'wss://stream.binance.com/stream';
 
 class BinanceAdapter extends EventEmitter {
   constructor({ apiKey, apiSecret, testnet = false } = {}) {

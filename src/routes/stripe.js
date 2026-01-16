@@ -22,8 +22,17 @@ router.post('/session', requireAuth, express.json(), async (req, res) => {
     // insert pending deposit
     await db.query('INSERT INTO deposits (user_id, amount_cents, reference, status, created_at) VALUES ($1,$2,$3,$4,NOW())', [userId, amount_cents, reference, 'pending']);
 
-    const successUrl = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/?deposit_success=1`;
-    const cancelUrl = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/?deposit_cancel=1`;
+    // Ensure FRONTEND_URL includes protocol (Stripe requires absolute URLs)
+    function buildFrontendUrl(pathQuery) {
+      const raw = process.env.FRONTEND_URL || 'http://localhost:5173';
+      const prefixed = raw.startsWith('http://') || raw.startsWith('https://') ? raw : `http://${raw}`;
+      // remove trailing slash
+      const base = prefixed.replace(/\/$/, '');
+      return `${base}${pathQuery.startsWith('/') ? pathQuery : '/' + pathQuery}`;
+    }
+
+    const successUrl = buildFrontendUrl('/app');
+    const cancelUrl = buildFrontendUrl('/app/deposit');
 
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],

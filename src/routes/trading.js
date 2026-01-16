@@ -93,7 +93,8 @@ router.post('/positions', requireAuth, validateOrder, async (req, res) => {
     }
 
     const result = await placeOrder({ userId: req.user.userId, side, order_type, price_cents, size, stop_loss_cents, take_profit_cents, symbol });
-    res.json(result);
+    if (result && result.ok) return res.json(result);
+    return res.status(400).json({ error: result.error || 'position_placement_failed' });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Position placement failed' });
@@ -145,14 +146,23 @@ router.get('/trades', requireAuth, async (req, res) => {
   res.json(q.rows);
 });
 
-// KYC submission
+// KYC submission (insert a new kyc_submissions row). Accepts the expanded KYC fields.
 router.post('/kyc/submit', requireAuth, async (req, res) => {
   try {
-    const { full_name, id_number, document_url } = req.body;
-    if (!full_name || !id_number) return res.status(400).json({ error: 'full_name and id_number required' });
+    const {
+      date_of_birth, phone,
+      country, city_state, street,
+      employer_company, employer_city,
+      id_number
+    } = req.body;
+    if (!id_number) return res.status(400).json({ error: 'id_number required' });
     const db = getDb();
-    await db.query('INSERT INTO kyc_submissions (user_id, full_name, id_number, document_url, status, created_at) VALUES ($1,$2,$3,$4,$5,NOW())', [req.user.userId, full_name, id_number, document_url || null, 'pending']);
-    res.json({ ok: true });
+    const insertQ = await db.query(
+      `INSERT INTO kyc_submissions (user_id, date_of_birth, phone, country, city_state, street, employer_company, employer_city, id_number, status, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW()) RETURNING *`,
+      [req.user.userId, date_of_birth || null, phone || null, country || null, city_state || null, street || null, employer_company || null, employer_city || null, id_number, 'pending']
+    );
+    res.json({ ok: true, kyc: insertQ.rows[0] });
   } catch (err) {
     console.error('kyc submit error', err);
     res.status(500).json({ error: 'kyc_submit_failed' });
@@ -162,7 +172,7 @@ router.post('/kyc/submit', requireAuth, async (req, res) => {
 router.get('/kyc/status', requireAuth, async (req, res) => {
   try {
     const db = getDb();
-    const q = await db.query('SELECT status, created_at FROM kyc_submissions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 1', [req.user.userId]);
+    const q = await db.query('SELECT * FROM kyc_submissions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 1', [req.user.userId]);
     if (q.rowCount === 0) return res.json({ status: 'not_submitted' });
     res.json(q.rows[0]);
   } catch (err) {

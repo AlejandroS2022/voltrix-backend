@@ -70,4 +70,9 @@ function startPriceStream() {
   });
 }
 
-module.exports = { startPriceStream };
+function invalidateFeeCache(symbol) {
+  if (!symbol) return feeCache.clear();
+  feeCache.delete(String(symbol).toUpperCase());
+}
+
+module.exports = { startPriceStream, invalidateFeeCache };

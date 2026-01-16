@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { getDb } = require('../db');
 const { requireAuth } = require('../middleware/auth');
+const { invalidateFeeCache } = require('../services/priceStream');
 
 async function requireAdmin(req, res, next) {
   try {
@@ -40,6 +41,8 @@ router.post('/fees', requireAuth, requireAdmin, async (req, res) => {
     } else {
       await db.query('UPDATE symbol_fees SET fee_type=$1, fee_value=$2, updated_at=NOW() WHERE symbol=$3', [fee_type, fee_value, symbol.toUpperCase()]);
     }
+    // invalidate in-memory fee cache so next tick picks up the change
+    try { invalidateFeeCache(symbol); } catch (e) { console.warn('invalidate fee cache failed', e); }
     res.json({ ok: true });
   } catch (err) {
     console.error('upsert fee error', err);
@@ -51,7 +54,10 @@ router.post('/fees', requireAuth, requireAdmin, async (req, res) => {
 router.get('/kyc', requireAuth, requireAdmin, async (req, res) => {
   try {
     const db = getDb();
-    const q = await db.query('SELECT id, user_id, full_name, id_number, document_url, status, created_at FROM kyc_submissions ORDER BY created_at DESC LIMIT 200');
+    const q = await db.query(
+      `SELECT id, user_id, first_name, last_name, date_of_birth, phone, country, city_state, street, employer_company, employer_city, id_number, document_url, status, created_at
+       FROM kyc_submissions ORDER BY created_at DESC LIMIT 200`
+    );
     res.json(q.rows);
   } catch (err) {
     console.error('fetch kyc error', err);

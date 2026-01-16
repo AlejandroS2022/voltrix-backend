@@ -1,8 +1,9 @@
 const { getDb } = require('../db');
 const { broadcastTrade } = require('../socket');
 const { v4: uuidv4 } = require('uuid');
+const redis = require('../config/redis');
 
-async function placeOrder({ userId, side, order_type = 'limit', price_cents = null, size, stop_loss_cents = null, take_profit_cents = null, symbol = 'BTCUSD' }) {
+async function placeOrder({ userId, side, order_type = 'limit', price_cents = null, size, stop_loss_cents = null, take_profit_cents = null, symbol = 'BTCUSDT' }) {
   // size is numeric (units), price_cents is integer for limit orders; market orders have price_cents == null
   const db = getDb();
   const client = await db.connect();
@@ -19,8 +20,19 @@ async function placeOrder({ userId, side, order_type = 'limit', price_cents = nu
 
     // Helper to fetch last trade price
     async function getLastPrice() {
+      // Try trades table first
       const pQ = await client.query('SELECT price_cents FROM trades WHERE symbol=$1 ORDER BY executed_at DESC LIMIT 1', [symbol]);
       if (pQ.rowCount) return pQ.rows[0].price_cents;
+      // fallback to Redis latest tick
+      try {
+        const raw = await redis.get(`tick_latest:${symbol}`);
+        if (raw) {
+          const tick = JSON.parse(raw);
+          if (tick && typeof tick.price_cents === 'number') return tick.price_cents;
+        }
+      } catch (err) {
+        console.warn('redis tick read failed', err);
+      }
       return null;
     }
 
@@ -64,10 +76,11 @@ async function placeOrder({ userId, side, order_type = 'limit', price_cents = nu
     // Broker order placement disabled: execute locally within platform using last known price or pending logic
     if (order_type === 'market') {
       if (!lastPrice) {
+        // no price available from trades or redis
         await client.query('ROLLBACK');
         return { error: 'no_price_available' };
       }
-      // Open position at lastPrice
+      // Open position at lastPrice (both entry and placed price)
       const res = await openPosition(lastPrice, lastPrice);
       if (res.error) return res;
       await client.query('COMMIT');
@@ -75,7 +88,7 @@ async function placeOrder({ userId, side, order_type = 'limit', price_cents = nu
     } else {
       // limit: if price crosses lastPrice then execute immediately, otherwise keep order open
       if (lastPrice && ((side === 'buy' && lastPrice <= price_cents) || (side === 'sell' && lastPrice >= price_cents))) {
-        const res = await openPosition(price_cents);
+        const res = await openPosition(price_cents, lastPrice);
         if (res.error) return res;
         await client.query('COMMIT');
         return res;
@@ -123,12 +136,29 @@ async function closePosition({ positionId, closePriceCents = null }) {
     // determine close price
     let closePrice = closePriceCents;
     if (closePrice === null || closePrice === undefined) {
+      // try trades table first
       const lp = await client.query('SELECT price_cents FROM trades WHERE symbol=$1 ORDER BY executed_at DESC LIMIT 1', [pos.symbol]);
       if (lp.rowCount === 0) {
+        // fallback to redis latest tick
+        try {
+          const raw = await redis.get(`tick_latest:${pos.symbol}`);
+          if (raw) {
+            const tick = JSON.parse(raw);
+            if (tick && typeof tick.price_cents === 'number') {
+              closePrice = tick.price_cents;
+            }
+          }
+        } catch (err) {
+          console.warn('redis tick read failed', err);
+        }
+      } else {
+        closePrice = lp.rows[0].price_cents;
+      }
+
+      if (!closePrice) {
         await client.query('ROLLBACK');
         return { error: 'no_price_available' };
       }
-      closePrice = lp.rows[0].price_cents;
     }
 
     const entryPrice = Number(pos.entry_price_cents);
@@ -199,8 +229,22 @@ async function activatePendingPosition({ positionId, marketPriceCents }) {
       return { error: 'position_not_pending' };
     }
 
+    // if marketPriceCents not provided, try to get latest tick from redis
+    let execPrice = marketPriceCents;
+    if (!execPrice) {
+      try {
+        const raw = await redis.get(`tick_latest:${pos.symbol}`);
+        if (raw) {
+          const tick = JSON.parse(raw);
+          if (tick && typeof tick.price_cents === 'number') execPrice = tick.price_cents;
+        }
+      } catch (err) {
+        console.warn('redis tick read failed', err);
+      }
+    }
+
     const entryPrice = Number(pos.entry_price_cents);
-    const execPrice = marketPriceCents || entryPrice;
+    execPrice = execPrice || entryPrice;
     const sizeNum = Number(pos.size);
     const entryAmount = BigInt(Math.ceil(execPrice * sizeNum));
 

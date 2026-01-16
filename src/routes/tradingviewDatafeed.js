@@ -83,7 +83,8 @@ router.post('/order', requireAuth, async (req, res) => {
     if (!side || !size) return res.status(400).json({ error: 'Missing fields' });
 
     const result = await placeOrder({ userId: req.user.userId, side, order_type, price_cents, size, stop_loss_cents, take_profit_cents, symbol: symbol || 'BTCUSD' });
-    res.json(result);
+    if (result && result.ok) return res.json(result);
+    return res.status(400).json({ error: result.error || 'order_failed' });
   } catch (err) {
     console.error('chart order error', err);
     res.status(500).json({ error: 'Order failed' });

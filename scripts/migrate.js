@@ -25,8 +25,17 @@ async function migrate() {
     user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
     amount_cents BIGINT NOT NULL,
     reference TEXT,
+    status VARCHAR(32) DEFAULT 'pending',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
   );
+
+  -- ensure deposits has status column for older schemas
+  DO $$
+  BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='deposits' AND column_name='status') THEN
+      ALTER TABLE deposits ADD COLUMN status VARCHAR(32) DEFAULT 'pending';
+    END IF;
+  END$$;
 
   CREATE TABLE IF NOT EXISTS withdrawals (
     id SERIAL PRIMARY KEY,
@@ -158,12 +167,51 @@ async function migrate() {
   CREATE TABLE IF NOT EXISTS kyc_submissions (
     id SERIAL PRIMARY KEY,
     user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    full_name TEXT NOT NULL,
-    id_number TEXT NOT NULL,
-    document_url TEXT,
+    date_of_birth DATE,
+    phone TEXT,
+    country TEXT,
+    city_state TEXT,
+    street TEXT,
+    employer_company TEXT,
+    employer_city TEXT,
+    id_number TEXT,
     status VARCHAR(32) DEFAULT 'pending', -- pending/approved/rejected
     created_at TIMESTAMPTZ DEFAULT now()
   );
+
+  -- ensure additional KYC columns exist for older schemas
+  DO $$
+  BEGIN
+    -- first_name and last_name are intentionally omitted; use users table instead
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='kyc_submissions' AND column_name='date_of_birth') THEN
+      ALTER TABLE kyc_submissions ADD COLUMN date_of_birth DATE;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='kyc_submissions' AND column_name='phone') THEN
+      ALTER TABLE kyc_submissions ADD COLUMN phone TEXT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='kyc_submissions' AND column_name='country') THEN
+      ALTER TABLE kyc_submissions ADD COLUMN country TEXT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='kyc_submissions' AND column_name='city_state') THEN
+      ALTER TABLE kyc_submissions ADD COLUMN city_state TEXT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='kyc_submissions' AND column_name='street') THEN
+      ALTER TABLE kyc_submissions ADD COLUMN street TEXT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='kyc_submissions' AND column_name='employer_company') THEN
+      ALTER TABLE kyc_submissions ADD COLUMN employer_company TEXT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='kyc_submissions' AND column_name='employer_city') THEN
+      ALTER TABLE kyc_submissions ADD COLUMN employer_city TEXT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='kyc_submissions' AND column_name='id_number') THEN
+      ALTER TABLE kyc_submissions ADD COLUMN id_number TEXT;
+    END IF;
+    -- document_url field removed; not stored here
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='kyc_submissions' AND column_name='status') THEN
+      ALTER TABLE kyc_submissions ADD COLUMN status VARCHAR(32) DEFAULT 'pending';
+    END IF;
+  END$$;
 
   -- Symbol-specific fee table
   CREATE TABLE IF NOT EXISTS symbol_fees (

@@ -1,6 +1,7 @@
 const express = require('express');
 const bcrypt = require('bcrypt');
 const axios = require('axios');
+const { requireAuth } = require('../middleware/auth');
 const { getDb } = require('../db');
 const { validateRegister, validateLogin } = require('../middleware/validate');
 const { generateAccessToken, generateRefreshToken, hashToken } = require('../utils/tokens');
@@ -56,7 +57,10 @@ router.post('/register', validateRegister, async (req, res) => {
     );
 
     setRefreshCookie(res, rawRefresh, REFRESH_TTL_DAYS * 24 * 3600);
-    res.status(201).json({ token: accessToken, user });
+    // include is_admin flag when returning user
+    const uQ = await db.query('SELECT id,email,first_name,last_name,is_admin FROM users WHERE id=$1', [user.id]);
+    const fullUser = uQ.rows[0];
+    res.status(201).json({ token: accessToken, user: fullUser });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Registration failed' });
@@ -85,10 +89,9 @@ router.post('/login', validateLogin, async (req, res) => {
     );
 
     setRefreshCookie(res, rawRefresh, REFRESH_TTL_DAYS * 24 * 3600);
-    res.json({
-      token: accessToken,
-      user: { id: user.id, email: user.email, first_name: user.first_name, last_name: user.last_name }
-    });
+    // include is_admin flag in login response
+    const uQ = await db.query('SELECT id,email,first_name,last_name,is_admin FROM users WHERE id=$1', [user.id]);
+    res.json({ token: accessToken, user: uQ.rows[0] });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Login failed' });
@@ -121,7 +124,7 @@ router.post('/refresh', async (req, res) => {
       [tokenRow.user_id, newHash, req.get('User-Agent') || null, req.ip || null, expiresAt]
     );
 
-    const userRes = await db.query('SELECT id,email,first_name,last_name FROM users WHERE id=$1', [tokenRow.user_id]);
+    const userRes = await db.query('SELECT id,email,first_name,last_name,is_admin FROM users WHERE id=$1', [tokenRow.user_id]);
     const user = userRes.rows[0];
     const accessToken = generateAccessToken({ userId: user.id, email: user.email });
 
@@ -166,14 +169,38 @@ router.get('/oauth/google', (req, res) => {
   res.redirect(url);
 });
 
+// helper: build a full frontend redirect URL and optionally append query params like error/provider
+function buildFrontendUrl(statePath) {
+  const frontend = process.env.FRONTEND_URL || '/';
+  const base = frontend.startsWith('http') ? frontend : `http://${frontend}`; // allow env with or without protocol
+  const path = statePath && statePath.startsWith('/') ? statePath : `/${statePath || ''}`;
+  // normalize: avoid double slashes
+  return `${base.replace(/\/$/, '')}${path}`;
+}
+
+function redirectWithError(res, state, errKey, provider) {
+  try {
+    const url = new URL(buildFrontendUrl(state));
+    if (errKey) url.searchParams.set('oauth_error', errKey);
+    if (provider) url.searchParams.set('oauth_provider', provider);
+    return res.redirect(302, url.toString());
+  } catch (e) {
+    // fallback: simple redirect
+    const fallback = buildFrontendUrl(state) + `?oauth_error=${encodeURIComponent(errKey || 'unknown')}&oauth_provider=${encodeURIComponent(provider || '')}`;
+    return res.redirect(302, fallback);
+  }
+}
+
 router.get('/oauth/google/callback', async (req, res) => {
   const code = req.query.code;
   const state = decodeURIComponent(req.query.state || '/');
-  if (!code) return res.status(400).json({ error: 'missing_code' });
+  // user cancelled or provider-specific error
+  if (req.query.error) return redirectWithError(res, state, req.query.error, 'google');
+  if (!code) return redirectWithError(res, state, 'missing_code', 'google');
   const clientId = process.env.GOOGLE_CLIENT_ID;
   const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
   const redirectUri = process.env.GOOGLE_OAUTH_CALLBACK;
-  if (!clientId || !clientSecret || !redirectUri) return res.status(501).json({ error: 'Google OAuth not configured' });
+  if (!clientId || !clientSecret || !redirectUri) return redirectWithError(res, state, 'not_configured', 'google');
 
   try {
     // Exchange code for tokens
@@ -185,13 +212,23 @@ router.get('/oauth/google/callback', async (req, res) => {
     params.append('grant_type', 'authorization_code');
 
     const tokenRes = await axios.post('https://oauth2.googleapis.com/token', params.toString(), { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
+    if (tokenRes.status !== 200 || tokenRes.data.error) {
+      console.error('google token exchange failed', tokenRes.status, tokenRes.data);
+      return redirectWithError(res, state, tokenRes.data.error_description || 'token_exchange_failed', 'google');
+    }
     const accessToken = tokenRes.data.access_token;
-    if (!accessToken) return res.status(502).json({ error: 'token_exchange_failed' });
+    if (!accessToken) return redirectWithError(res, state, 'token_missing', 'google');
 
     // Fetch user info
-    const userRes = await axios.get(`https://www.googleapis.com/oauth2/v2/userinfo?access_token=${accessToken}`);
+    let userRes;
+    try {
+      userRes = await axios.get(`https://www.googleapis.com/oauth2/v2/userinfo?access_token=${accessToken}`);
+    } catch (uerr) {
+      console.error('google userinfo fetch failed', uerr && uerr.response ? uerr.response.data : uerr.message || uerr);
+      return redirectWithError(res, state, 'userinfo_failed', 'google');
+    }
     const profile = userRes.data || {};
-    if (!profile.email) return res.status(400).json({ error: 'email_required' });
+    if (!profile.email) return redirectWithError(res, state, 'email_required', 'google');
 
     const db = getDb();
     let user;
@@ -201,9 +238,12 @@ router.get('/oauth/google/callback', async (req, res) => {
       // optionally update names
       await db.query('UPDATE users SET first_name=$1, last_name=$2 WHERE id=$3', [profile.given_name || user.first_name, profile.family_name || user.last_name, user.id]);
     } else {
+      // social signup: DB requires password_hash NOT NULL, create a dummy hashed password
+      const dummyPassword = generateRefreshToken();
+      const dummyHash = await bcrypt.hash(dummyPassword, SALT_ROUNDS);
       const r = await db.query(
-        `INSERT INTO users (email, first_name, last_name, created_at) VALUES ($1,$2,$3,NOW()) RETURNING id,email,first_name,last_name`,
-        [profile.email, profile.given_name || '', profile.family_name || '']
+        `INSERT INTO users (email, first_name, last_name, password_hash, created_at) VALUES ($1,$2,$3,$4,NOW()) RETURNING id,email,first_name,last_name,is_admin`,
+        [profile.email, profile.given_name || '', profile.family_name || '', dummyHash]
       );
       user = r.rows[0];
       await db.query('INSERT INTO wallets (user_id, balance_cents) VALUES ($1,0) ON CONFLICT DO NOTHING', [user.id]);
@@ -218,12 +258,10 @@ router.get('/oauth/google/callback', async (req, res) => {
     setRefreshCookie(res, rawRefresh, REFRESH_TTL_DAYS * 24 * 3600);
 
     // Redirect back to frontend (state) — frontend should call /api/auth/refresh to get access token
-    const frontend = process.env.FRONTEND_URL || '/';
-    const redirectTo = `${frontend}${state.startsWith('/') ? state : '/' + state}`;
-    return res.redirect(302, redirectTo);
+    return res.redirect(302, buildFrontendUrl(state));
   } catch (err) {
-    console.error('google oauth callback error', err && err.response ? err.response.data : err);
-    return res.status(500).json({ error: 'google_oauth_failed' });
+    console.error('google oauth callback error', err && err.response ? err.response.data : err.message || err);
+    return redirectWithError(res, state, 'google_oauth_failed', 'google');
   }
 });
 
@@ -240,24 +278,35 @@ router.get('/oauth/facebook', (req, res) => {
 router.get('/oauth/facebook/callback', async (req, res) => {
   const code = req.query.code;
   const state = decodeURIComponent(req.query.state || '/');
-  if (!code) return res.status(400).json({ error: 'missing_code' });
+  if (req.query.error) return redirectWithError(res, state, req.query.error, 'facebook');
+  if (!code) return redirectWithError(res, state, 'missing_code', 'facebook');
   const clientId = process.env.FACEBOOK_CLIENT_ID;
   const clientSecret = process.env.FACEBOOK_CLIENT_SECRET;
   const redirectUri = process.env.FACEBOOK_OAUTH_CALLBACK;
-  if (!clientId || !clientSecret || !redirectUri) return res.status(501).json({ error: 'Facebook OAuth not configured' });
+  if (!clientId || !clientSecret || !redirectUri) return redirectWithError(res, state, 'not_configured', 'facebook');
 
   try {
     // Exchange code for access token
     const tokenUrl = `https://graph.facebook.com/v16.0/oauth/access_token?client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&client_secret=${encodeURIComponent(clientSecret)}&code=${encodeURIComponent(code)}`;
     const tokenRes = await axios.get(tokenUrl);
+    if (tokenRes.status !== 200 || tokenRes.data.error) {
+      console.error('facebook token exchange failed', tokenRes.status, tokenRes.data);
+      return redirectWithError(res, state, tokenRes.data.error?.message || 'token_exchange_failed', 'facebook');
+    }
     const accessToken = tokenRes.data.access_token;
-    if (!accessToken) return res.status(502).json({ error: 'token_exchange_failed' });
+    if (!accessToken) return redirectWithError(res, state, 'token_missing', 'facebook');
 
     // Fetch profile
-    const profileUrl = `https://graph.facebook.com/me?fields=id,email,first_name,last_name&access_token=${encodeURIComponent(accessToken)}`;
-    const profileRes = await axios.get(profileUrl);
+    let profileRes;
+    try {
+      const profileUrl = `https://graph.facebook.com/me?fields=id,email,first_name,last_name&access_token=${encodeURIComponent(accessToken)}`;
+      profileRes = await axios.get(profileUrl);
+    } catch (uerr) {
+      console.error('facebook userinfo fetch failed', uerr && uerr.response ? uerr.response.data : uerr.message || uerr);
+      return redirectWithError(res, state, 'userinfo_failed', 'facebook');
+    }
     const profile = profileRes.data || {};
-    if (!profile.email) return res.status(400).json({ error: 'email_required' });
+    if (!profile.email) return redirectWithError(res, state, 'email_required', 'facebook');
 
     const db = getDb();
     let user;
@@ -266,9 +315,12 @@ router.get('/oauth/facebook/callback', async (req, res) => {
       user = existing.rows[0];
       await db.query('UPDATE users SET first_name=$1, last_name=$2 WHERE id=$3', [profile.first_name || user.first_name, profile.last_name || user.last_name, user.id]);
     } else {
+      // social signup: DB requires password_hash NOT NULL, create a dummy hashed password
+      const dummyPassword = generateRefreshToken();
+      const dummyHash = await bcrypt.hash(dummyPassword, SALT_ROUNDS);
       const r = await db.query(
-        `INSERT INTO users (email, first_name, last_name, created_at) VALUES ($1,$2,$3,NOW()) RETURNING id,email,first_name,last_name`,
-        [profile.email, profile.first_name || '', profile.last_name || '']
+        `INSERT INTO users (email, first_name, last_name, password_hash, created_at) VALUES ($1,$2,$3,$4,NOW()) RETURNING id,email,first_name,last_name`,
+        [profile.email, profile.first_name || '', profile.last_name || '', dummyHash]
       );
       user = r.rows[0];
       await db.query('INSERT INTO wallets (user_id, balance_cents) VALUES ($1,0) ON CONFLICT DO NOTHING', [user.id]);
@@ -282,12 +334,25 @@ router.get('/oauth/facebook/callback', async (req, res) => {
     await db.query(`INSERT INTO refresh_tokens (user_id, token_hash, user_agent, ip_address, expires_at) VALUES ($1,$2,$3,$4,$5)`, [user.id, refreshHash, req.get('User-Agent') || null, req.ip || null, expiresAt]);
     setRefreshCookie(res, rawRefresh, REFRESH_TTL_DAYS * 24 * 3600);
 
-    const frontend = process.env.FRONTEND_URL || '/';
-    const redirectTo = `${frontend}${state.startsWith('/') ? state : '/' + state}`;
-    return res.redirect(302, redirectTo);
+    return res.redirect(302, buildFrontendUrl(state));
   } catch (err) {
-    console.error('facebook oauth callback error', err && err.response ? err.response.data : err);
-    return res.status(500).json({ error: 'facebook_oauth_failed' });
+    console.error('facebook oauth callback error', err && err.response ? err.response.data : err.message || err);
+    return redirectWithError(res, state, 'facebook_oauth_failed', 'facebook');
+  }
+});
+
+// Update basic profile fields (first_name, last_name)
+router.post('/profile', requireAuth, async (req, res) => {
+  try {
+    const { first_name, last_name } = req.body;
+    if (!first_name && !last_name) return res.status(400).json({ error: 'Nothing to update' });
+    const db = getDb();
+    await db.query('UPDATE users SET first_name = COALESCE($1, first_name), last_name = COALESCE($2, last_name) WHERE id=$3', [first_name || null, last_name || null, req.user.userId]);
+    const uQ = await db.query('SELECT id,email,first_name,last_name,is_admin FROM users WHERE id=$1', [req.user.userId]);
+    res.json({ ok: true, user: uQ.rows[0] });
+  } catch (err) {
+    console.error('profile update failed', err);
+    res.status(500).json({ error: 'profile_update_failed' });
   }
 });
 
