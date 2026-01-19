@@ -230,6 +230,13 @@ async function migrate() {
       ALTER TABLE users ADD COLUMN is_admin BOOLEAN DEFAULT FALSE;
     END IF;
   END$$;
+  -- store Stripe Connect account id for payouts
+  DO $$
+  BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='stripe_account_id') THEN
+      ALTER TABLE users ADD COLUMN stripe_account_id TEXT;
+    END IF;
+  END$$;
   `;
   try {
     await client.query(sql);

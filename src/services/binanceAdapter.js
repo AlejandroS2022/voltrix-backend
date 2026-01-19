@@ -3,7 +3,7 @@ const EventEmitter = require('events');
 const redis = require('../config/redis');
 
 const EMIT_CHANNEL = 'market:prices';
-const BINANCE_FUTURES_WS = 'wss://stream.binance.com/stream';
+const BINANCE_WS = process.env.BINANCE_WS_URL || 'wss://stream.binance.com/stream';
 
 class BinanceAdapter extends EventEmitter {
   constructor({ apiKey, apiSecret, testnet = false } = {}) {
@@ -20,7 +20,7 @@ class BinanceAdapter extends EventEmitter {
   startMarketData(symbols = ['BTCUSDT']) {
     // always start market data even if no API key — public feed
     const streams = symbols.map(s => `${s.toLowerCase()}@trade`).join('/');
-    const url = `${BINANCE_FUTURES_WS}?streams=${streams}`;
+    const url = `${BINANCE_WS}?streams=${streams}`;
     this.ws = new WebSocket(url);
     this.ws.on('open', () => console.log('Binance market websocket connected'));
     this.ws.on('error', (e) => console.error('Binance WS error', e));

@@ -7,6 +7,8 @@ const { v4: uuidv4 } = require('uuid');
 const { cacheGet, cacheSet } = require('../utils/cache');
 
 const router = express.Router();
+const Stripe = require('stripe');
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '');
 
 router.get('/wallet', requireAuth, async (req, res) => {
   const db = getDb();
@@ -65,16 +67,46 @@ router.post('/withdraw', requireAuth, validateDepositWithdraw, async (req, res) 
       return res.status(400).json({ error: 'Insufficient funds' });
     }
 
+    // Check Stripe Connect account for this user
+    const userQ = await db.query('SELECT stripe_account_id FROM users WHERE id=$1', [req.user.userId]);
+    const acctId = userQ.rowCount ? userQ.rows[0].stripe_account_id : null;
+    if (!acctId) {
+      await db.query('ROLLBACK');
+      return res.status(400).json({ error: 'connect_account_required' });
+    }
+
+    // debit wallet and create withdrawal row as pending
     await db.query(
       'UPDATE wallets SET balance_cents = balance_cents - $1 WHERE user_id=$2',
       [amount_cents, req.user.userId]
     );
-    await db.query(
-      'INSERT INTO withdrawals (user_id, amount_cents, status, created_at) VALUES ($1, $2, $3, NOW())',
-      [req.user.userId, amount_cents, 'completed']
+    const withdrawRes = await db.query(
+      'INSERT INTO withdrawals (user_id, amount_cents, status, created_at) VALUES ($1, $2, $3, NOW()) RETURNING id',
+      [req.user.userId, amount_cents, 'pending']
     );
-    await db.query('COMMIT');
-    res.json({ success: true });
+    const withdrawalId = withdrawRes.rows[0].id;
+
+    // create a transfer to the connected account (platform must have Stripe balance for this)
+    try {
+      const transfer = await stripe.transfers.create({
+        amount: amount_cents,
+        currency: 'usd',
+        destination: acctId,
+        metadata: { withdrawal_id: String(withdrawalId), user_id: String(req.user.userId) }
+      });
+
+      // mark withdrawal completed
+      await db.query('UPDATE withdrawals SET status=$1 WHERE id=$2', ['completed', withdrawalId]);
+      await db.query('COMMIT');
+      return res.json({ success: true, transfer_id: transfer.id });
+    } catch (err) {
+      // attempt to revert wallet debit
+      await db.query('UPDATE wallets SET balance_cents = balance_cents + $1 WHERE user_id=$2', [amount_cents, req.user.userId]);
+      await db.query('UPDATE withdrawals SET status=$1 WHERE id=$2', ['failed', withdrawalId]);
+      await db.query('COMMIT');
+      console.error('stripe transfer failed', err);
+      return res.status(500).json({ error: 'transfer_failed' });
+    }
   } catch (err) {
     await db.query('ROLLBACK');
     console.error(err);
@@ -155,14 +187,27 @@ router.post('/kyc/submit', requireAuth, async (req, res) => {
       employer_company, employer_city,
       id_number
     } = req.body;
-    if (!id_number) return res.status(400).json({ error: 'id_number required' });
-    const db = getDb();
-    const insertQ = await db.query(
-      `INSERT INTO kyc_submissions (user_id, date_of_birth, phone, country, city_state, street, employer_company, employer_city, id_number, status, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW()) RETURNING *`,
-      [req.user.userId, date_of_birth || null, phone || null, country || null, city_state || null, street || null, employer_company || null, employer_city || null, id_number, 'pending']
-    );
-    res.json({ ok: true, kyc: insertQ.rows[0] });
+    // id_number is optional during incremental KYC submissions
+      const db = getDb();
+      // If the user already has a KYC row, update it instead of inserting a new one.
+      const existing = await db.query('SELECT id FROM kyc_submissions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 1', [req.user.userId]);
+      let kycRow;
+      if (existing.rowCount > 0) {
+        const id = existing.rows[0].id;
+        const upd = await db.query(
+          `UPDATE kyc_submissions SET date_of_birth=$1, phone=$2, country=$3, city_state=$4, street=$5, employer_company=$6, employer_city=$7, id_number=$8, status=$9 WHERE id=$10 RETURNING *`,
+          [date_of_birth || null, phone || null, country || null, city_state || null, street || null, employer_company || null, employer_city || null, id_number, 'pending', id]
+        );
+        kycRow = upd.rows[0];
+      } else {
+        const insertQ = await db.query(
+          `INSERT INTO kyc_submissions (user_id, date_of_birth, phone, country, city_state, street, employer_company, employer_city, id_number, status, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW()) RETURNING *`,
+          [req.user.userId, date_of_birth || null, phone || null, country || null, city_state || null, street || null, employer_company || null, employer_city || null, id_number, 'pending']
+        );
+        kycRow = insertQ.rows[0];
+      }
+      res.json({ ok: true, kyc: kycRow });
   } catch (err) {
     console.error('kyc submit error', err);
     res.status(500).json({ error: 'kyc_submit_failed' });

@@ -55,8 +55,7 @@ router.get('/kyc', requireAuth, requireAdmin, async (req, res) => {
   try {
     const db = getDb();
     const q = await db.query(
-      `SELECT id, user_id, first_name, last_name, date_of_birth, phone, country, city_state, street, employer_company, employer_city, id_number, document_url, status, created_at
-       FROM kyc_submissions ORDER BY created_at DESC LIMIT 200`
+      `SELECT * FROM kyc_submissions ORDER BY created_at DESC LIMIT 200`
     );
     res.json(q.rows);
   } catch (err) {

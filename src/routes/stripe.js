@@ -7,6 +7,56 @@ const { requireAuth } = require('../middleware/auth');
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '');
 
+// helper to ensure frontend urls
+function buildFrontendUrl(pathQuery) {
+  const raw = process.env.FRONTEND_URL || 'http://localhost:5173';
+  const prefixed = raw.startsWith('http://') || raw.startsWith('https://') ? raw : `http://${raw}`;
+  const base = prefixed.replace(/\/$/, '');
+  return `${base}${pathQuery.startsWith('/') ? pathQuery : '/' + pathQuery}`;
+}
+
+// Create a Stripe Connect account (Express) and save the account id on the user record.
+router.post('/connect/create-account', requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const db = getDb();
+    const q = await db.query('SELECT email, stripe_account_id FROM users WHERE id=$1', [userId]);
+    if (q.rowCount === 0) return res.status(404).json({ error: 'user_not_found' });
+    const user = q.rows[0];
+    if (user.stripe_account_id) return res.json({ ok: true, stripe_account_id: user.stripe_account_id });
+
+    const account = await stripe.accounts.create({ type: 'express', email: user.email });
+    await db.query('UPDATE users SET stripe_account_id=$1 WHERE id=$2', [account.id, userId]);
+    res.json({ ok: true, stripe_account_id: account.id });
+  } catch (err) {
+    console.error('create connect account error', err);
+    res.status(500).json({ error: 'create_connect_account_failed' });
+  }
+});
+
+// Create an account link to redirect the user to Stripe onboarding (Express)
+router.get('/connect/account-link', requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const db = getDb();
+    const q = await db.query('SELECT stripe_account_id FROM users WHERE id=$1', [userId]);
+    if (q.rowCount === 0) return res.status(404).json({ error: 'user_not_found' });
+    const acctId = q.rows[0].stripe_account_id;
+    if (!acctId) return res.status(400).json({ error: 'connect_account_required' });
+
+    const accountLink = await stripe.accountLinks.create({
+      account: acctId,
+      refresh_url: buildFrontendUrl('/app/profile'),
+      return_url: buildFrontendUrl('/app/profile'),
+      type: 'account_onboarding'
+    });
+    res.json({ url: accountLink.url });
+  } catch (err) {
+    console.error('create account link error', err);
+    res.status(500).json({ error: 'create_account_link_failed' });
+  }
+});
+
 // Create a Checkout Session for deposit. We create a pending deposit record
 // and return the session URL to the client. The client should redirect the
 // user to the returned session.url.
@@ -111,6 +161,24 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
       await db.query('ROLLBACK');
       console.error('Failed to process stripe webhook', err);
       return res.status(500).json({ error: 'webhook_processing_failed' });
+    }
+  }
+
+  // Handle account updates (onboarding / verification state changes)
+  if (event.type && event.type.startsWith('account.')) {
+    try {
+      const acct = event.data.object;
+      const acctId = acct.id;
+      // find user with this stripe account and update KYC status or store account info
+      const db = getDb();
+      const q = await db.query('SELECT id FROM users WHERE stripe_account_id=$1', [acctId]);
+      if (q.rowCount > 0) {
+        const userId = q.rows[0].id;
+        // store last verification state in kyc_submissions or users as desired — keep lightweight: store last_account_details
+        await db.query('UPDATE users SET /* no-op for now */ stripe_account_id = stripe_account_id WHERE id=$1', [userId]);
+      }
+    } catch (err) {
+      console.error('account.updated webhook handling failed', err);
     }
   }
 
