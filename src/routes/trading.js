@@ -9,6 +9,7 @@ const { cacheGet, cacheSet } = require('../utils/cache');
 const router = express.Router();
 const Stripe = require('stripe');
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '');
+const { writeLedger } = require('../utils/ledger');
 
 router.get('/wallet', requireAuth, async (req, res) => {
   const db = getDb();
@@ -26,17 +27,31 @@ router.post('/deposit', requireAuth, validateDepositWithdraw, async (req, res) =
   try {
     const { amount_cents, reference } = req.body;
     if (!amount_cents || amount_cents <= 0) return res.status(400).json({ error: 'Amount is required' });
+    // lock wallet and compute before/after balances
+    const wq = await db.query('SELECT balance_cents FROM wallets WHERE user_id=$1 FOR UPDATE', [req.user.userId]);
+    const before = parseInt((wq.rows[0] && wq.rows[0].balance_cents) || 0, 10);
+    const after = before + amount_cents;
 
-    await db.query(
-      'UPDATE wallets SET balance_cents = balance_cents + $1 WHERE user_id=$2',
-      [amount_cents, req.user.userId]
-    );
-    await db.query(
-      'INSERT INTO deposits (user_id, amount_cents, reference, created_at) VALUES ($1, $2, $3, NOW())',
-      [req.user.userId, amount_cents, reference || uuidv4()]
-    );
+    await db.query('UPDATE wallets SET balance_cents = $1 WHERE user_id=$2', [after, req.user.userId]);
+
+    const ref = reference || uuidv4();
+    await db.query('INSERT INTO deposits (user_id, amount_cents, reference, created_at, status) VALUES ($1, $2, $3, NOW(), $4)', [req.user.userId, amount_cents, ref, 'completed']);
+
+    // ledger entry for deposit
+    await writeLedger(db, {
+      userId: req.user.userId,
+      related_order_id: null,
+      change_cents: amount_cents,
+      balance_before: before,
+      balance_after: after,
+      type: 'deposit',
+      meta: { reference: ref },
+      reference: ref,
+      status: 'completed'
+    });
+
     await db.query('COMMIT');
-    res.json({ success: true });
+    res.json({ success: true, reference: ref });
   } catch (err) {
     await db.query('ROLLBACK');
     console.error(err);
@@ -76,15 +91,29 @@ router.post('/withdraw', requireAuth, validateDepositWithdraw, async (req, res) 
     }
 
     // debit wallet and create withdrawal row as pending
-    await db.query(
-      'UPDATE wallets SET balance_cents = balance_cents - $1 WHERE user_id=$2',
-      [amount_cents, req.user.userId]
-    );
+    const walletBeforeQ = await db.query('SELECT balance_cents FROM wallets WHERE user_id=$1 FOR UPDATE', [req.user.userId]);
+    const walletBefore = parseInt((walletBeforeQ.rows[0] && walletBeforeQ.rows[0].balance_cents) || 0, 10);
+    const walletAfter = walletBefore - amount_cents;
+
+    await db.query('UPDATE wallets SET balance_cents = $1 WHERE user_id=$2', [walletAfter, req.user.userId]);
     const withdrawRes = await db.query(
       'INSERT INTO withdrawals (user_id, amount_cents, status, created_at) VALUES ($1, $2, $3, NOW()) RETURNING id',
       [req.user.userId, amount_cents, 'pending']
     );
     const withdrawalId = withdrawRes.rows[0].id;
+
+    // ledger entry for pending withdrawal (negative change)
+    const ledgerId = await writeLedger(db, {
+      userId: req.user.userId,
+      related_order_id: null,
+      change_cents: -amount_cents,
+      balance_before: walletBefore,
+      balance_after: walletAfter,
+      type: 'withdrawal',
+      meta: { withdrawal_id: withdrawalId },
+      reference: String(withdrawalId),
+      status: 'pending'
+    });
 
     // create a transfer to the connected account (platform must have Stripe balance for this)
     try {
@@ -95,17 +124,34 @@ router.post('/withdraw', requireAuth, validateDepositWithdraw, async (req, res) 
         metadata: { withdrawal_id: String(withdrawalId), user_id: String(req.user.userId) }
       });
 
-      // mark withdrawal completed
+      // mark withdrawal completed and update ledger status
       await db.query('UPDATE withdrawals SET status=$1 WHERE id=$2', ['completed', withdrawalId]);
+      await db.query('UPDATE ledger SET status=$1, updated_at=NOW() WHERE id=$2', ['completed', ledgerId]);
       await db.query('COMMIT');
       return res.json({ success: true, transfer_id: transfer.id });
     } catch (err) {
       // attempt to revert wallet debit
       await db.query('UPDATE wallets SET balance_cents = balance_cents + $1 WHERE user_id=$2', [amount_cents, req.user.userId]);
       await db.query('UPDATE withdrawals SET status=$1 WHERE id=$2', ['failed', withdrawalId]);
+      // update the pending ledger entry to failed
+      await db.query('UPDATE ledger SET status=$1, updated_at=NOW() WHERE id=$2', ['failed', ledgerId]);
+      // insert a refund ledger entry to reflect the returned funds
+      const refundBefore = walletAfter + amount_cents; // after revert
+      const refundAfter = refundBefore;
+      await writeLedger(db, {
+        userId: req.user.userId,
+        related_order_id: null,
+        change_cents: amount_cents,
+        balance_before: walletAfter,
+        balance_after: refundAfter,
+        type: 'refund',
+        meta: { refund_of: withdrawalId },
+        reference: String(withdrawalId),
+        status: 'completed'
+      });
       await db.query('COMMIT');
       console.error('stripe transfer failed', err);
-      return res.status(500).json({ error: 'transfer_failed' });
+      return res.status(500).json({ error: 'transfer_failed', message: err && err.message ? err.message : undefined });
     }
   } catch (err) {
     await db.query('ROLLBACK');
@@ -178,6 +224,67 @@ router.get('/trades', requireAuth, async (req, res) => {
   res.json(q.rows);
 });
 
+// Unified transactions endpoint: use ledger as the canonical history table
+router.get('/transactions', requireAuth, async (req, res) => {
+  try {
+    const db = getDb();
+    const page = Math.max(parseInt(req.query.page || '1', 10), 1);
+    const pageSize = Math.min(Math.max(parseInt(req.query.page_size || '50', 10), 1), 200);
+    const offset = (page - 1) * pageSize;
+
+    const filters = [req.user.userId];
+    let where = 'WHERE user_id=$1';
+    let idx = 2;
+    if (req.query.type) {
+      where += ` AND type = $${idx}`;
+      filters.push(req.query.type);
+      idx++;
+    }
+    if (req.query.status) {
+      where += ` AND status = $${idx}`;
+      filters.push(req.query.status);
+      idx++;
+    }
+    if (req.query.start_date) {
+      where += ` AND created_at >= $${idx}`;
+      filters.push(req.query.start_date);
+      idx++;
+    }
+    if (req.query.end_date) {
+      where += ` AND created_at <= $${idx}`;
+      filters.push(req.query.end_date);
+      idx++;
+    }
+
+    const totalRes = await db.query(`SELECT COUNT(1) AS total FROM ledger ${where}`, filters);
+    const total = parseInt(totalRes.rows[0].total, 10) || 0;
+
+    const q = await db.query(
+      `SELECT id, reference AS ref, created_at, type AS display_type, change_cents AS amount_cents, status, meta
+        FROM ledger ${where} ORDER BY created_at DESC LIMIT $${idx} OFFSET $${idx + 1}`,
+      [...filters, pageSize, offset]
+    );
+
+    res.json({
+      page,
+      page_size: pageSize,
+      total,
+      data: q.rows.map(r => ({
+        id: r.id,
+        ref: r.ref || String(r.id),
+        date: r.created_at,
+        type: r.display_type,
+        amount_cents: parseInt(r.amount_cents, 10) || 0,
+        status: r.status || null,
+        meta: r.meta || null
+      }))
+    });
+  } catch (err) {
+    console.error('transactions list error', err);
+    res.status(500).json({ error: 'transactions_list_failed' });
+  }
+});
+
 // KYC submission (insert a new kyc_submissions row). Accepts the expanded KYC fields.
 router.post('/kyc/submit', requireAuth, async (req, res) => {
   try {
@@ -196,7 +303,7 @@ router.post('/kyc/submit', requireAuth, async (req, res) => {
         const id = existing.rows[0].id;
         const upd = await db.query(
           `UPDATE kyc_submissions SET date_of_birth=$1, phone=$2, country=$3, city_state=$4, street=$5, employer_company=$6, employer_city=$7, id_number=$8, status=$9 WHERE id=$10 RETURNING *`,
-          [date_of_birth || null, phone || null, country || null, city_state || null, street || null, employer_company || null, employer_city || null, id_number, 'pending', id]
+          [date_of_birth || null, phone || null, country || null, city_state || null, street || null, employer_company || null, employer_city || null, id_number || null, 'pending', id]
         );
         kycRow = upd.rows[0];
       } else {

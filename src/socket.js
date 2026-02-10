@@ -7,21 +7,32 @@ function setupSocket(httpServer) {
   const io = new Server(httpServer, { cors: { origin: '*' } });
   ioInstance = io;
 
+  // Allow unauthenticated (guest) connections so public price feeds remain available
+  // If a token is provided, verify and attach user info; otherwise continue as guest.
   io.use((socket, next) => {
     const token = socket.handshake.auth?.token;
-    if (!token) return next(new Error('Auth token required'));
+    if (!token) return next(); // allow guest
     try {
       const payload = jwt.verify(token, process.env.JWT_SECRET);
       socket.user = { userId: payload.userId, email: payload.email };
-      return next();
     } catch (err) {
-      return next(new Error('Invalid token'));
+      console.warn('socket auth failed, proceeding as guest');
     }
+    return next();
   });
 
   io.on('connection', (socket) => {
     console.log('client connected', socket.id);
-    socket.on('subscribe', (symbol) => socket.join(`asset:${symbol}`));
+    // Auto-join a private room for authenticated users so server can notify them directly
+    if (socket.user && socket.user.userId) {
+      try { socket.join(`user:${socket.user.userId}`); } catch (e) {}
+    }
+    socket.on('subscribe', (symbol) => {
+      if (symbol) socket.join(`asset:${symbol}`);
+    });
+    socket.on('unsubscribe', (symbol) => {
+      if (symbol) socket.leave(`asset:${symbol}`);
+    });
     socket.on('disconnect', () => console.log('client disconnected', socket.id));
   });
 
@@ -41,10 +52,19 @@ function broadcastPrice(price) {
   ioInstance.to(`asset:${symbol}`).emit('price', price);
 }
 
+function notifyUser(userId, event, payload) {
+  if (!ioInstance || !userId) {
+    console.log('[Socket] notifyUser skipped: ioInstance or userId missing');
+    return;
+  }
+  console.log(`[Socket] notifyUser: userId=${userId}, event=${event}, payload=`, payload);
+  ioInstance.to(`user:${userId}`).emit(event, payload);
+}
+
 function broadcastCandle(candle) {
   if (!ioInstance) return;
   const symbol = candle.symbol || 'BTCUSDT';
   ioInstance.to(`asset:${symbol}`).emit('candle', candle);
 }
 
-module.exports = { setupSocket, broadcastTrade, broadcastPrice, broadcastCandle };
+module.exports = { setupSocket, broadcastTrade, broadcastPrice, broadcastCandle, notifyUser };

@@ -6,6 +6,7 @@ const { getDb } = require('../db');
 const { requireAuth } = require('../middleware/auth');
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '');
+const { writeLedger } = require('../utils/ledger');
 
 // helper to ensure frontend urls
 function buildFrontendUrl(pathQuery) {
@@ -18,6 +19,10 @@ function buildFrontendUrl(pathQuery) {
 // Create a Stripe Connect account (Express) and save the account id on the user record.
 router.post('/connect/create-account', requireAuth, async (req, res) => {
   try {
+    if (!process.env.STRIPE_SECRET_KEY) {
+      console.error('Stripe secret key not configured');
+      return res.status(500).json({ error: 'stripe_not_configured' });
+    }
     const userId = req.user.userId;
     const db = getDb();
     const q = await db.query('SELECT email, stripe_account_id FROM users WHERE id=$1', [userId]);
@@ -29,14 +34,19 @@ router.post('/connect/create-account', requireAuth, async (req, res) => {
     await db.query('UPDATE users SET stripe_account_id=$1 WHERE id=$2', [account.id, userId]);
     res.json({ ok: true, stripe_account_id: account.id });
   } catch (err) {
-    console.error('create connect account error', err);
-    res.status(500).json({ error: 'create_connect_account_failed' });
+    console.error('create connect account error', err && err.message ? err.message : err);
+    // surface Stripe error message to client for debugging (safe to show message)
+    return res.status(500).json({ error: 'create_connect_account_failed', message: err && err.message ? err.message : undefined });
   }
 });
 
 // Create an account link to redirect the user to Stripe onboarding (Express)
 router.get('/connect/account-link', requireAuth, async (req, res) => {
   try {
+    if (!process.env.STRIPE_SECRET_KEY) {
+      console.error('Stripe secret key not configured');
+      return res.status(500).json({ error: 'stripe_not_configured' });
+    }
     const userId = req.user.userId;
     const db = getDb();
     const q = await db.query('SELECT stripe_account_id FROM users WHERE id=$1', [userId]);
@@ -52,8 +62,8 @@ router.get('/connect/account-link', requireAuth, async (req, res) => {
     });
     res.json({ url: accountLink.url });
   } catch (err) {
-    console.error('create account link error', err);
-    res.status(500).json({ error: 'create_account_link_failed' });
+    console.error('create account link error', err && err.message ? err.message : err);
+    return res.status(500).json({ error: 'create_account_link_failed', message: err && err.message ? err.message : undefined });
   }
 });
 
@@ -140,11 +150,13 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
       await db.query('BEGIN');
       // idempotency: check deposit row
       const q = await db.query('SELECT id, status FROM deposits WHERE reference=$1 FOR UPDATE', [reference]);
+      let depositId = null;
       if (q.rowCount === 0) {
-        // no deposit found — insert one
-        await db.query('INSERT INTO deposits (user_id, amount_cents, reference, status, created_at) VALUES ($1,$2,$3,$4,NOW())', [userId, amount_cents, reference, 'completed']);
+        const ins = await db.query('INSERT INTO deposits (user_id, amount_cents, reference, status, created_at) VALUES ($1,$2,$3,$4,NOW()) RETURNING id', [userId, amount_cents, reference, 'completed']);
+        depositId = ins.rows[0].id;
       } else {
         const row = q.rows[0];
+        depositId = row.id;
         if (row.status === 'completed') {
           await db.query('COMMIT');
           return res.json({ received: true });
@@ -152,8 +164,24 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
         await db.query('UPDATE deposits SET status=$1 WHERE reference=$2', ['completed', reference]);
       }
 
-      // credit wallet
-      await db.query('UPDATE wallets SET balance_cents = balance_cents + $1 WHERE user_id=$2', [amount_cents, userId]);
+      // lock wallet, compute before/after and update
+      const wq = await db.query('SELECT balance_cents FROM wallets WHERE user_id=$1 FOR UPDATE', [userId]);
+      const before = parseInt((wq.rows[0] && wq.rows[0].balance_cents) || 0, 10);
+      const after = before + amount_cents;
+      await db.query('UPDATE wallets SET balance_cents = $1 WHERE user_id=$2', [after, userId]);
+
+      // write ledger entry for deposit
+      await writeLedger(db, {
+        userId,
+        related_order_id: depositId,
+        change_cents: amount_cents,
+        balance_before: before,
+        balance_after: after,
+        type: 'deposit',
+        meta: { reference },
+        reference,
+        status: 'completed'
+      });
 
       await db.query('COMMIT');
       return res.json({ received: true });

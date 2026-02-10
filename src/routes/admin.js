@@ -50,6 +50,23 @@ router.post('/fees', requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
+// delete a fee by id
+router.delete('/fees/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const db = getDb();
+    const q = await db.query('SELECT symbol FROM symbol_fees WHERE id=$1 LIMIT 1', [id]);
+    if (q.rowCount === 0) return res.status(404).json({ error: 'not_found' });
+    const symbol = q.rows[0].symbol;
+    await db.query('DELETE FROM symbol_fees WHERE id=$1', [id]);
+    try { invalidateFeeCache(symbol); } catch (e) { console.warn('invalidate fee cache failed', e); }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('delete fee error', err);
+    res.status(500).json({ error: 'delete_fee_failed' });
+  }
+});
+
 // KYC admin endpoints: list submissions and approve/reject
 router.get('/kyc', requireAuth, requireAdmin, async (req, res) => {
   try {

@@ -54,7 +54,8 @@ function startPriceStream() {
               const pct = parseFloat(fee.fee_value) || 0;
               enriched.price_with_fee_cents = Math.round(parsed.price_cents * (1 + pct / 100));
             } else {
-              const fixed = Math.round(parseFloat(fee.fee_value) || 0);
+              // fee.fee_value is a decimal amount (e.g. 0.30 for $0.30); convert to cents
+              const fixed = Math.round((parseFloat(fee.fee_value) || 0) * 100);
               enriched.price_with_fee_cents = parsed.price_cents + fixed;
             }
           }

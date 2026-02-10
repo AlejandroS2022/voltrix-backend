@@ -6,10 +6,12 @@ const { closePosition } = require('./matchingEngine');
 const SUB_CHANNEL = 'market:prices';
 
 async function handleTick(tick) {
-  // tick: { symbol, price_cents, size, ts }
-  if (!tick || !tick.symbol || !tick.price_cents) return;
-  const price = Number(tick.price_cents);
+  // tick: may include raw_bid_cents and raw_ask_cents (bookTicker)
+  if (!tick || !tick.symbol) return;
   const symbol = tick.symbol;
+  const rawBid = tick.raw_bid_cents || tick.bid_cents || null;
+  const rawAsk = tick.raw_ask_cents || tick.ask_cents || null;
+  if (rawBid === null || rawAsk === null) return;
   const db = getDb();
 
   // Find open positions with SL/TP that should trigger at this price
@@ -36,20 +38,23 @@ async function handleTick(tick) {
       let triggered = null; // 'sl' or 'tp'
 
       if (o.side === 'buy') {
-        if (sl !== null && price <= sl) triggered = 'sl';
-        if (tp !== null && price >= tp) triggered = 'tp';
+        // for buy positions, check the bid price (what we'd get when selling)
+        if (sl !== null && rawBid <= sl) triggered = 'sl';
+        if (tp !== null && rawBid >= tp) triggered = 'tp';
       } else {
-        if (sl !== null && price >= sl) triggered = 'sl';
-        if (tp !== null && price <= tp) triggered = 'tp';
+        // for sell positions, check the ask price (what we'd pay to buy back)
+        if (sl !== null && rawAsk >= sl) triggered = 'sl';
+        if (tp !== null && rawAsk <= tp) triggered = 'tp';
       }
 
       if (!triggered) continue;
 
       // Close the open position atomically
       try {
-        const res = await closePosition({ positionId: o.id, closePriceCents: price });
+        // Let matchingEngine pick the appropriate close price from redis (it will prefer ask for buy, bid for sell)
+        const res = await closePosition({ positionId: o.id });
         if (res && res.ok) {
-          console.log(`Position ${o.id} closed by ${triggered} at price ${price} (${symbol}), pnl=${res.pnl}`);
+          console.log(`Position ${o.id} closed by ${triggered} (${symbol}), pnl=${res.pnl}`);
         } else {
           console.warn(`Position ${o.id} SL/TP close attempted but failed`, res);
         }

@@ -155,6 +155,20 @@ async function migrate() {
     created_at TIMESTAMPTZ DEFAULT now()
   );
 
+  -- ledger additional columns for unified transaction history
+  DO $$
+  BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='ledger' AND column_name='reference') THEN
+      ALTER TABLE ledger ADD COLUMN reference TEXT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='ledger' AND column_name='status') THEN
+      ALTER TABLE ledger ADD COLUMN status VARCHAR(32);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='ledger' AND column_name='updated_at') THEN
+      ALTER TABLE ledger ADD COLUMN updated_at TIMESTAMPTZ;
+    END IF;
+  END$$;
+
   CREATE TABLE IF NOT EXISTS holds (
     id SERIAL PRIMARY KEY,
     user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
