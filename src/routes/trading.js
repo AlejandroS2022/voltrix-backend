@@ -65,11 +65,12 @@ router.post('/withdraw', requireAuth, validateDepositWithdraw, async (req, res) 
   try {
     const { amount_cents } = req.body;
     if (!amount_cents || amount_cents <= 0) return res.status(400).json({ error: 'Amount is required' });
-    // Ensure KYC approved
-    const kycQ = await db.query('SELECT status FROM kyc_submissions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 1', [req.user.userId]);
-    if (kycQ.rowCount === 0 || kycQ.rows[0].status !== 'approved') {
+    
+    // Check Stripe Connect account status instead of legacy KYC
+    const userQ = await db.query('SELECT stripe_account_id FROM users WHERE id=$1', [req.user.userId]);
+    if (!userQ.rowCount || !userQ.rows[0].stripe_account_id) {
       await db.query('ROLLBACK');
-      return res.status(403).json({ error: 'kyc_required' });
+      return res.status(403).json({ error: 'stripe_connect_required' });
     }
 
     const wallet = await db.query(
@@ -82,8 +83,7 @@ router.post('/withdraw', requireAuth, validateDepositWithdraw, async (req, res) 
       return res.status(400).json({ error: 'Insufficient funds' });
     }
 
-    // Check Stripe Connect account for this user
-    const userQ = await db.query('SELECT stripe_account_id FROM users WHERE id=$1', [req.user.userId]);
+    // Use the already-fetched stripe_account_id
     const acctId = userQ.rowCount ? userQ.rows[0].stripe_account_id : null;
     if (!acctId) {
       await db.query('ROLLBACK');
