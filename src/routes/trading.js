@@ -59,6 +59,14 @@ router.post('/deposit', requireAuth, validateDepositWithdraw, async (req, res) =
   }
 });
 
+// Helper to build frontend URL
+function buildFrontendUrl(pathQuery) {
+  const raw = process.env.FRONTEND_URL || 'http://localhost:5173';
+  const prefixed = raw.startsWith('http://') || raw.startsWith('https://') ? raw : `http://${raw}`;
+  const base = prefixed.replace(/\/$/, '');
+  return `${base}${pathQuery.startsWith('/') ? pathQuery : '/' + pathQuery}`;
+}
+
 router.post('/withdraw', requireAuth, validateDepositWithdraw, async (req, res) => {
   const db = getDb();
   await db.query('BEGIN');
@@ -66,11 +74,69 @@ router.post('/withdraw', requireAuth, validateDepositWithdraw, async (req, res) 
     const { amount_cents } = req.body;
     if (!amount_cents || amount_cents <= 0) return res.status(400).json({ error: 'Amount is required' });
     
-    // Check Stripe Connect account status instead of legacy KYC
-    const userQ = await db.query('SELECT stripe_account_id FROM users WHERE id=$1', [req.user.userId]);
-    if (!userQ.rowCount || !userQ.rows[0].stripe_account_id) {
+    // Check KYC status - must be approved for withdrawals
+    const kycQ = await db.query('SELECT status FROM kyc_submissions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 1', [req.user.userId]);
+    if (kycQ.rowCount === 0 || kycQ.rows[0].status !== 'approved') {
       await db.query('ROLLBACK');
-      return res.status(403).json({ error: 'stripe_connect_required' });
+      return res.status(403).json({ error: 'kyc_required' });
+    }
+
+    // Check if user has Stripe Connect account - if not, create one and return onboarding link
+    const userQ = await db.query('SELECT stripe_account_id FROM users WHERE id=$1', [req.user.userId]);
+    let stripeAccountId = userQ.rows[0]?.stripe_account_id;
+    
+    if (!stripeAccountId) {
+      // Create Stripe Connect Express account
+      const userEmailQ = await db.query('SELECT email FROM users WHERE id=$1', [req.user.userId]);
+      const email = userEmailQ.rows[0]?.email;
+      
+      const account = await stripe.accounts.create({
+        type: 'express',
+        email: email,
+        capabilities: {
+          card_payments: { requested: true },
+          transfers: { requested: true },
+        },
+      });
+      
+      stripeAccountId = account.id;
+      await db.query('UPDATE users SET stripe_account_id=$1 WHERE id=$2', [stripeAccountId, req.user.userId]);
+      
+      // Create account link for onboarding
+      const accountLink = await stripe.accountLinks.create({
+        account: stripeAccountId,
+        refresh_url: buildFrontendUrl('/app/withdraw'),
+        return_url: buildFrontendUrl('/app/withdraw'),
+        type: 'account_onboarding',
+      });
+      
+      await db.query('COMMIT');
+      return res.json({ 
+        requires_onboarding: true, 
+        onboarding_url: accountLink.url 
+      });
+    }
+
+    // Check if Stripe account is fully set up (has charges enabled)
+    try {
+      const account = await stripe.accounts.retrieve(stripeAccountId);
+      if (!account.charges_enabled || !account.payouts_enabled) {
+        // Account needs more info - create new onboarding link
+        const accountLink = await stripe.accountLinks.create({
+          account: stripeAccountId,
+          refresh_url: buildFrontendUrl('/app/withdraw'),
+          return_url: buildFrontendUrl('/app/withdraw'),
+          type: 'account_onboarding',
+        });
+        
+        await db.query('COMMIT');
+        return res.json({ 
+          requires_onboarding: true, 
+          onboarding_url: accountLink.url 
+        });
+      }
+    } catch (acctErr) {
+      console.error('Error retrieving Stripe account:', acctErr);
     }
 
     const wallet = await db.query(
@@ -81,13 +147,6 @@ router.post('/withdraw', requireAuth, validateDepositWithdraw, async (req, res) 
     if (balance < amount_cents) {
       await db.query('ROLLBACK');
       return res.status(400).json({ error: 'Insufficient funds' });
-    }
-
-    // Use the already-fetched stripe_account_id
-    const acctId = userQ.rowCount ? userQ.rows[0].stripe_account_id : null;
-    if (!acctId) {
-      await db.query('ROLLBACK');
-      return res.status(400).json({ error: 'connect_account_required' });
     }
 
     // debit wallet and create withdrawal row as pending
@@ -115,44 +174,29 @@ router.post('/withdraw', requireAuth, validateDepositWithdraw, async (req, res) 
       status: 'pending'
     });
 
-    // create a transfer to the connected account (platform must have Stripe balance for this)
+    // Create transfer to connected account
     try {
       const transfer = await stripe.transfers.create({
         amount: amount_cents,
         currency: 'usd',
-        destination: acctId,
-        metadata: { withdrawal_id: String(withdrawalId), user_id: String(req.user.userId) }
+        destination: stripeAccountId,
+        metadata: { 
+          withdrawal_id: String(withdrawalId), 
+          user_id: String(req.user.userId) 
+        }
       });
-
-      // mark withdrawal completed and update ledger status
-      await db.query('UPDATE withdrawals SET status=$1 WHERE id=$2', ['completed', withdrawalId]);
+      
+      await db.query('UPDATE withdrawals SET status=$1, stripe_transfer_id=$2 WHERE id=$3', ['completed', transfer.id, withdrawalId]);
       await db.query('UPDATE ledger SET status=$1, updated_at=NOW() WHERE id=$2', ['completed', ledgerId]);
-      await db.query('COMMIT');
-      return res.json({ success: true, transfer_id: transfer.id });
-    } catch (err) {
-      // attempt to revert wallet debit
-      await db.query('UPDATE wallets SET balance_cents = balance_cents + $1 WHERE user_id=$2', [amount_cents, req.user.userId]);
-      await db.query('UPDATE withdrawals SET status=$1 WHERE id=$2', ['failed', withdrawalId]);
-      // update the pending ledger entry to failed
-      await db.query('UPDATE ledger SET status=$1, updated_at=NOW() WHERE id=$2', ['failed', ledgerId]);
-      // insert a refund ledger entry to reflect the returned funds
-      const refundBefore = walletAfter + amount_cents; // after revert
-      const refundAfter = refundBefore;
-      await writeLedger(db, {
-        userId: req.user.userId,
-        related_order_id: null,
-        change_cents: amount_cents,
-        balance_before: walletAfter,
-        balance_after: refundAfter,
-        type: 'refund',
-        meta: { refund_of: withdrawalId },
-        reference: String(withdrawalId),
-        status: 'completed'
-      });
-      await db.query('COMMIT');
-      console.error('stripe transfer failed', err);
-      return res.status(500).json({ error: 'transfer_failed', message: err && err.message ? err.message : undefined });
+    } catch (transferErr) {
+      // If transfer fails, mark as pending - will be processed later
+      console.error('Transfer creation failed:', transferErr);
+      await db.query('UPDATE withdrawals SET status=$1 WHERE id=$2', ['pending', withdrawalId]);
+      await db.query('UPDATE ledger SET status=$1, updated_at=NOW() WHERE id=$2', ['pending', ledgerId]);
     }
+    
+    await db.query('COMMIT');
+    return res.json({ success: true });
   } catch (err) {
     await db.query('ROLLBACK');
     console.error(err);
