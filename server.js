@@ -58,14 +58,20 @@ app.use('/api/price', priceRoutes);
     // start pending position activator
     const { startPendingActivator } = require('./src/services/pendingActivator');
     startPendingActivator();
-    // start Binance adapter (market data + order placement integration)
-    const binance = require('./src/services/binanceAdapterInstance');
-    // start market data for main symbols (configurable via BINANCE_SYMBOLS env var)
-    const symbolsEnv = process.env.BINANCE_SYMBOLS || 'BTCUSDT,ETHUSDT,BNBUSDT';
-    const symbols = symbolsEnv.split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
-    binance.startMarketData(symbols);
-    // NOTE: user-data stream and broker order placement are disabled — broker used only for market data
-    app.locals.binanceAdapter = binance;
+    // Binance adapter is disabled — migrating to Twelve Data for Forex/Stock prices.
+    // To re-enable, uncomment the block below and set BINANCE_ENABLE=true in .env
+    // const binance = require('./src/services/binanceAdapterInstance');
+    // const binanceSymbolsEnv = process.env.BINANCE_SYMBOLS || 'BTCUSDT,ETHUSDT,BNBUSDT';
+    // const binanceSymbols = binanceSymbolsEnv.split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+    // binance.startMarketData(binanceSymbols);
+    // app.locals.binanceAdapter = binance;
+
+    // start Twelve Data adapter (Forex/Stock prices) - configure via TWELVEDATA_SYMBOLS env var
+    const twelveData = require('./src/services/twelveDataAdapterInstance');
+    const tdSymbolsEnv = process.env.TWELVEDATA_SYMBOLS || 'BTC/USD,ETH/USD,EUR/USD,GBP/USD,USD/JPY,AUD/USD,USD/CAD,AAPL,MSFT,GOOGL,AMZN,TSLA';
+    const tdSymbols = tdSymbolsEnv.split(',').map(s => s.trim()).filter(Boolean);
+    twelveData.startMarketData(tdSymbols);
+    app.locals.twelveDataAdapter = twelveData;
     const port = process.env.PORT || 3000;
     server.listen(port, () => console.log(`Server listening on ${port}`));
   } catch (err) {

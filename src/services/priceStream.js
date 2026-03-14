@@ -41,7 +41,7 @@ function startPriceStream() {
   subscriber.on('message', (channel, message) => {
     try {
       const parsed = JSON.parse(message);
-      // expected { symbol, price_cents, size, ts }
+      // expected { symbol, price_cents, bid_cents, ask_cents, ts }
       (async () => {
         try {
           const fee = await getFeeForSymbol(parsed.symbol);

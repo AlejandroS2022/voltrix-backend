@@ -76,19 +76,45 @@ async function placeOrder({ userId, side, order_type = 'limit', price_cents = nu
     async function getLastPrice() {
       // Prefer Redis latest tick (most real-time); fallback to trades table
       try {
-        const raw = await redis.get(`tick_latest:${symbol}`);
-        if (raw) {
-          const tick = JSON.parse(raw);
-          if (tick) {
-            // prefer raw values if available so fees can be applied later
-            if (typeof tick.raw_bid_cents === 'number' && typeof tick.raw_ask_cents === 'number') return Math.round((tick.raw_bid_cents + tick.raw_ask_cents) / 2);
-            if (typeof tick.raw_bid_cents === 'number') return tick.raw_bid_cents;
-            if (typeof tick.raw_ask_cents === 'number') return tick.raw_ask_cents;
-            if (typeof tick.price_cents === 'number') return tick.price_cents;
-            if (typeof tick.bid_cents === 'number' && typeof tick.ask_cents === 'number') return Math.round((tick.bid_cents + tick.ask_cents) / 2);
-            if (typeof tick.bid_cents === 'number') return tick.bid_cents;
-            if (typeof tick.ask_cents === 'number') return tick.ask_cents;
+        // Build candidate keys (symbol, USD/USDT variant)
+        const candidates = [symbol];
+        if (String(symbol).endsWith('USDT')) {
+          candidates.push(String(symbol).replace(/USDT$/, 'USD'));
+        } else if (String(symbol).endsWith('USD')) {
+          candidates.push(String(symbol).replace(/USD$/, 'USDT'));
+        }
+
+        // Fetch all candidate ticks and pick the most recent (by ts)
+        const ticks = [];
+        for (const s of candidates) {
+          try {
+            const raw = await redis.get(`tick_latest:${s}`);
+            if (!raw) continue;
+            const tick = JSON.parse(raw);
+            if (!tick) continue;
+            tick._redis_key = s;
+            ticks.push(tick);
+          } catch (e) {
+            console.warn('redis tick parse failed for', s, e);
+            continue;
           }
+        }
+
+        if (ticks.length > 0) {
+          let tick = ticks.find(t => t._redis_key === symbol) || null;
+          if (!tick) {
+            ticks.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+            tick = ticks[0];
+          }
+
+          // prefer raw values if available so fees can be applied later
+          if (typeof tick.raw_bid_cents === 'number' && typeof tick.raw_ask_cents === 'number') return Math.round((tick.raw_bid_cents + tick.raw_ask_cents) / 2);
+          if (typeof tick.raw_bid_cents === 'number') return tick.raw_bid_cents;
+          if (typeof tick.raw_ask_cents === 'number') return tick.raw_ask_cents;
+          if (typeof tick.price_cents === 'number') return tick.price_cents;
+          if (typeof tick.bid_cents === 'number' && typeof tick.ask_cents === 'number') return Math.round((tick.bid_cents + tick.ask_cents) / 2);
+          if (typeof tick.bid_cents === 'number') return tick.bid_cents;
+          if (typeof tick.ask_cents === 'number') return tick.ask_cents;
         }
       } catch (err) {
         console.warn('redis tick read failed', err);
@@ -145,25 +171,54 @@ async function placeOrder({ userId, side, order_type = 'limit', price_cents = nu
     }
 
     // Decide execution for market orders or immediate limit fills
-    // Normalize symbol: uppercase and use exchange symbol (BTCUSDT not BTCUSD) so ticks match
+    // Normalize symbol: uppercase. Prefer USD variant for platform pricing (use BTCUSD not BTCUSDT)
     symbol = (symbol || 'BTCUSD').toUpperCase();
-    if (symbol.endsWith('USD') && !symbol.endsWith('USDT')) symbol = symbol.replace(/USD$/, 'USDT');
+    // If a USDT symbol is provided, convert to USD so we consistently use USD ticks
+    if (symbol.endsWith('USDT')) {
+      symbol = symbol.replace(/USDT$/, 'USD');
+    }
     const lastPrice = await getLastPrice();
     // Broker order placement disabled: execute locally within platform using last known price or pending logic
     if (order_type === 'market') {
       // choose execution price: prefer raw ask for buy, raw bid for sell from Redis tick, fallback to lastPrice
       let execPerUnit = lastPrice;
       try {
-        const raw = await redis.get(`tick_latest:${symbol}`);
-        if (raw) {
-          const tick = JSON.parse(raw);
-          if (tick) {
-            if (side === 'buy' && typeof tick.raw_ask_cents === 'number') execPerUnit = tick.raw_ask_cents;
-            else if (side === 'sell' && typeof tick.raw_bid_cents === 'number') execPerUnit = tick.raw_bid_cents;
-            else if (side === 'buy' && typeof tick.ask_cents === 'number') execPerUnit = tick.ask_cents;
-            else if (side === 'sell' && typeof tick.bid_cents === 'number') execPerUnit = tick.bid_cents;
-            else if (typeof tick.price_cents === 'number') execPerUnit = tick.price_cents;
+        // Build candidates and load all ticks, pick most recent
+        const candidates = [symbol];
+        if (String(symbol).endsWith('USDT')) {
+          candidates.push(String(symbol).replace(/USDT$/, 'USD'));
+        } else if (String(symbol).endsWith('USD')) {
+          candidates.push(String(symbol).replace(/USD$/, 'USDT'));
+        }
+
+        const ticks = [];
+        for (const s of candidates) {
+          try {
+            const raw = await redis.get(`tick_latest:${s}`);
+            if (!raw) continue;
+            const tick = JSON.parse(raw);
+            if (!tick) continue;
+            tick._redis_key = s;
+            ticks.push(tick);
+          } catch (e) {
+            console.warn('redis tick parse failed for', s, e);
+            continue;
           }
+        }
+
+        if (ticks.length > 0) {
+          // Prefer exact-key tick first, otherwise pick most recent
+          let tick = ticks.find(t => t._redis_key === symbol) || null;
+          if (!tick) {
+            ticks.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+            tick = ticks[0];
+          }
+
+          if (side === 'buy' && typeof tick.raw_ask_cents === 'number') { execPerUnit = tick.raw_ask_cents; }
+          else if (side === 'sell' && typeof tick.raw_bid_cents === 'number') { execPerUnit = tick.raw_bid_cents; }
+          else if (side === 'buy' && typeof tick.ask_cents === 'number') { execPerUnit = tick.ask_cents; }
+          else if (side === 'sell' && typeof tick.bid_cents === 'number') { execPerUnit = tick.bid_cents; }
+          else if (typeof tick.price_cents === 'number') { execPerUnit = tick.price_cents; }
         }
       } catch (err) {
         console.warn('redis tick read failed', err);

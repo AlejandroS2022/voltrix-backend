@@ -377,4 +377,47 @@ router.get('/kyc/status', requireAuth, async (req, res) => {
   }
 });
 
+// Favorite symbols management
+router.get('/favorites', requireAuth, async (req, res) => {
+  try {
+    const db = getDb();
+    const q = await db.query('SELECT symbol, created_at FROM user_favorite_symbols WHERE user_id=$1 ORDER BY created_at DESC', [req.user.userId]);
+    res.json(q.rows.map(r => r.symbol));
+  } catch (err) {
+    console.error('favorites list error', err);
+    res.status(500).json({ error: 'favorites_list_failed' });
+  }
+});
+
+router.post('/favorites', requireAuth, async (req, res) => {
+  try {
+    const { symbol } = req.body;
+    if (!symbol || typeof symbol !== 'string') return res.status(400).json({ error: 'invalid_symbol' });
+    const db = getDb();
+    // upsert to avoid duplicates
+    await db.query(
+      `INSERT INTO user_favorite_symbols (user_id, symbol, created_at)
+       VALUES ($1,$2,NOW()) ON CONFLICT (user_id, symbol) DO NOTHING`,
+      [req.user.userId, symbol.toUpperCase()]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('favorites add error', err);
+    res.status(500).json({ error: 'favorites_add_failed' });
+  }
+});
+
+router.delete('/favorites/:symbol', requireAuth, async (req, res) => {
+  try {
+    const symbol = req.params.symbol;
+    if (!symbol) return res.status(400).json({ error: 'invalid_symbol' });
+    const db = getDb();
+    await db.query('DELETE FROM user_favorite_symbols WHERE user_id=$1 AND symbol=$2', [req.user.userId, symbol.toUpperCase()]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('favorites delete error', err);
+    res.status(500).json({ error: 'favorites_delete_failed' });
+  }
+});
+
 module.exports = router;

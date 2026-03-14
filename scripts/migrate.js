@@ -251,6 +251,19 @@ async function migrate() {
       ALTER TABLE users ADD COLUMN stripe_account_id TEXT;
     END IF;
   END$$;
+  -- user favorite symbols table
+  CREATE TABLE IF NOT EXISTS user_favorite_symbols (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    symbol VARCHAR(32) NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now()
+  );
+  DO $$
+  BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE tablename='user_favorite_symbols' AND indexname='uq_user_symbol') THEN
+      CREATE UNIQUE INDEX uq_user_symbol ON user_favorite_symbols (user_id, symbol);
+    END IF;
+  END$$;
   `;
   try {
     await client.query(sql);
