@@ -282,4 +282,58 @@ router.post('/profile', requireAuth, async (req, res) => {
   }
 });
 
+/**
+ * Password recovery endpoints
+ * - POST /auth/forgot-password { email }
+ * - POST /auth/verify-reset-code { email, code }
+ * - POST /auth/reset-password { email, code, new_password }
+ */
+const crypto = require('crypto');
+
+// In-memory store for demo; replace with persistent store in production
+const resetCodes = new Map();
+
+router.post('/forgot-password', async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'Email required' });
+  const db = getDb();
+  const userQ = await db.query('SELECT id FROM users WHERE email=$1', [email]);
+  if (userQ.rowCount === 0) return res.status(404).json({ error: 'Email not found' });
+
+  // Generate code and store (should send via email in production)
+  const code = (Math.floor(100000 + Math.random() * 900000)).toString();
+  resetCodes.set(email, { code, expires: Date.now() + 15 * 60 * 1000 }); // 15 min expiry
+
+  // TODO: send code via email
+  if (NODE_ENV !== 'production') console.log(`[DEV] Password reset code for ${email}: ${code}`);
+
+  res.json({ ok: true });
+});
+
+router.post('/verify-reset-code', async (req, res) => {
+  const { email, code } = req.body;
+  if (!email || !code) return res.status(400).json({ error: 'Email and code required' });
+  const entry = resetCodes.get(email);
+  if (!entry || entry.code !== code || entry.expires < Date.now()) {
+    return res.status(400).json({ error: 'Invalid or expired code' });
+  }
+  res.json({ ok: true });
+});
+
+router.post('/reset-password', async (req, res) => {
+  const { email, code, new_password } = req.body;
+  if (!email || !code || !new_password) return res.status(400).json({ error: 'Missing fields' });
+  const entry = resetCodes.get(email);
+  if (!entry || entry.code !== code || entry.expires < Date.now()) {
+    return res.status(400).json({ error: 'Invalid or expired code' });
+  }
+  const db = getDb();
+  const userQ = await db.query('SELECT id FROM users WHERE email=$1', [email]);
+  if (userQ.rowCount === 0) return res.status(404).json({ error: 'Email not found' });
+  const password_hash = await bcrypt.hash(new_password, SALT_ROUNDS);
+  await db.query('UPDATE users SET password_hash=$1 WHERE email=$2', [password_hash, email]);
+  resetCodes.delete(email);
+  res.json({ ok: true });
+});
+
 module.exports = router;

@@ -105,4 +105,70 @@ router.post('/kyc/:id/reject', requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
+router.get('/all-positions', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const db = getDb();
+    const q = await db.query(
+      `SELECT p.id, p.user_id, u.email, p.symbol, p.side, p.size, p.entry_price_cents, p.placed_price_cents, p.order_type, p.stop_loss_cents, p.take_profit_cents, p.status, p.realized_pnl_cents, p.created_at, p.closed_at, p.close_price_cents
+         FROM positions p
+         JOIN users u ON p.user_id = u.id
+         WHERE p.status = 'open'
+         ORDER BY p.created_at DESC`
+    );
+    res.json(q.rows);
+  } catch (err) {
+    console.error('admin all-positions error', err);
+    res.status(500).json({ error: 'all_positions_failed' });
+  }
+});
+
+router.patch('/positions/:id', requireAuth, requireAdmin, async (req, res) => {
+  const db = getDb();
+  const positionId = req.params.id;
+  const allowedFields = [
+    'symbol', 'side', 'order_type', 'size', 'entry_price_cents', 'placed_price_cents',
+    'stop_loss_cents', 'take_profit_cents', 'status', 'realized_pnl_cents', 'close_price_cents', 'closed_at'
+  ];
+  const updates = [];
+  const values = [];
+  let idx = 1;
+  for (const field of allowedFields) {
+    if (field in req.body) {
+      updates.push(`${field}=$${idx}`);
+      values.push(req.body[field]);
+      idx++;
+    }
+  }
+  if (updates.length === 0) return res.status(400).json({ error: 'no_fields_to_update' });
+  values.push(positionId);
+  try {
+    await db.query(
+      `UPDATE positions SET ${updates.join(', ')} WHERE id=$${idx}`,
+      values
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('admin position edit error', err);
+    res.status(500).json({ error: 'admin_position_edit_failed' });
+  }
+});
+
+/**
+ * ADMIN: List all users in the system
+ * GET /admin/users
+ * Requires admin privileges
+ */
+router.get('/users', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const db = getDb();
+    const q = await db.query(
+      `SELECT id, email, first_name, last_name, created_at, is_admin FROM users ORDER BY created_at DESC`
+    );
+    res.json(q.rows);
+  } catch (err) {
+    console.error('admin users list error', err);
+    res.status(500).json({ error: 'users_list_failed' });
+  }
+});
+
 module.exports = router;
