@@ -2,6 +2,7 @@ const WebSocket = require('ws');
 const EventEmitter = require('events');
 const redis = require('../config/redis');
 const { getDb } = require('../db');
+const axios = require('axios');
 
 const EMIT_CHANNEL = 'market:prices';
 // Twelve Data WebSocket URL - try the time series endpoint for price updates
@@ -186,13 +187,27 @@ class TwelveDataAdapter extends EventEmitter {
 
           // Only allow saving to Redis if price is present, or if this is the first tick for this symbol
           let shouldSave = false;
+          let fallbackPrice = null;
           if (rawPrice !== null) {
             shouldSave = true;
           } else {
             // Check if Redis already has a value for this symbol
             try {
               const existing = await redis.get(`tick_latest:${internalSymbol}`);
-              if (!existing) shouldSave = true; // Save only if no previous value exists
+              if (!existing) {
+                // Try to fetch last price from Twelve Data REST API as fallback
+                try {
+                  const apiKey = this.apiKey;
+                  const url = `https://api.twelvedata.com/price?symbol=${encodeURIComponent(symbol)}${apiKey ? `&apikey=${apiKey}` : ''}`;
+                  const resp = await axios.get(url, { timeout: 5000 });
+                  if (resp.data && resp.data.price) {
+                    fallbackPrice = Math.round(parseFloat(resp.data.price) * 100);
+                    shouldSave = true;
+                  }
+                } catch (err) {
+                  console.warn('Twelve Data REST fallback failed for', symbol, err?.message || err);
+                }
+              }
             } catch (e) {
               shouldSave = false;
             }
@@ -204,8 +219,9 @@ class TwelveDataAdapter extends EventEmitter {
 
           // Since Twelve Data doesn't provide bid/ask, use price as both
           // Fee will be applied below to create spread
-          const rawBid = rawPrice;
-          const rawAsk = rawPrice;
+          const finalPrice = rawPrice !== null ? rawPrice : fallbackPrice;
+          const rawBid = finalPrice;
+          const rawAsk = finalPrice;
 
           // Fetch fee for symbol from DB
           let fee = null;
