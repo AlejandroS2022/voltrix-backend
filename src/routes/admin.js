@@ -108,14 +108,33 @@ router.post('/kyc/:id/reject', requireAuth, requireAdmin, async (req, res) => {
 router.get('/all-positions', requireAuth, requireAdmin, async (req, res) => {
   try {
     const db = getDb();
+    const page = Math.max(parseInt(req.query.page || '1', 10), 1);
+    const pageSize = Math.min(Math.max(parseInt(req.query.page_size || '20', 10), 1), 100);
+    const offset = (page - 1) * pageSize;
+
+    const totalRes = await db.query(
+      `SELECT COUNT(1) AS total
+         FROM positions p
+         JOIN users u ON p.user_id = u.id
+         WHERE p.status = 'open'`
+    );
+    const total = parseInt(totalRes.rows[0].total, 10) || 0;
+
     const q = await db.query(
       `SELECT p.id, p.user_id, u.email, p.symbol, p.side, p.size, p.entry_price_cents, p.placed_price_cents, p.order_type, p.stop_loss_cents, p.take_profit_cents, p.status, p.realized_pnl_cents, p.created_at, p.closed_at, p.close_price_cents
          FROM positions p
          JOIN users u ON p.user_id = u.id
          WHERE p.status = 'open'
-         ORDER BY p.created_at DESC`
+         ORDER BY p.created_at DESC
+         LIMIT $1 OFFSET $2`,
+      [pageSize, offset]
     );
-    res.json(q.rows);
+    res.json({
+      page,
+      page_size: pageSize,
+      total,
+      data: q.rows
+    });
   } catch (err) {
     console.error('admin all-positions error', err);
     res.status(500).json({ error: 'all_positions_failed' });
@@ -161,10 +180,23 @@ router.patch('/positions/:id', requireAuth, requireAdmin, async (req, res) => {
 router.get('/users', requireAuth, requireAdmin, async (req, res) => {
   try {
     const db = getDb();
+    const page = Math.max(parseInt(req.query.page || '1', 10), 1);
+    const pageSize = Math.min(Math.max(parseInt(req.query.page_size || '20', 10), 1), 100);
+    const offset = (page - 1) * pageSize;
+
+    const totalRes = await db.query('SELECT COUNT(1) AS total FROM users');
+    const total = parseInt(totalRes.rows[0].total, 10) || 0;
+
     const q = await db.query(
-      `SELECT id, email, first_name, last_name, created_at, is_admin FROM users ORDER BY created_at DESC`
+      `SELECT id, email, first_name, last_name, created_at, is_admin FROM users ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
+      [pageSize, offset]
     );
-    res.json(q.rows);
+    res.json({
+      page,
+      page_size: pageSize,
+      total,
+      data: q.rows
+    });
   } catch (err) {
     console.error('admin users list error', err);
     res.status(500).json({ error: 'users_list_failed' });
