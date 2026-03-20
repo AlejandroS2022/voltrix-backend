@@ -179,11 +179,25 @@ class TwelveDataAdapter extends EventEmitter {
           if (!symbol) return;
 
           const internalSymbol = this._toInternalSymbol(symbol);
-          
+
           // Parse price - Twelve Data sends prices as floats
           // No bid/ask available from free tier — synthesize from price
-          const rawPrice = data.price ? Math.round(parseFloat(data.price) * 100) : null;
-          if (!rawPrice) return;
+          const rawPrice = data.price !== undefined && data.price !== null ? Math.round(parseFloat(data.price) * 100) : null;
+
+          // Only allow saving to Redis if price is present, or if this is the first tick for this symbol
+          let shouldSave = false;
+          if (rawPrice !== null) {
+            shouldSave = true;
+          } else {
+            // Check if Redis already has a value for this symbol
+            try {
+              const existing = await redis.get(`tick_latest:${internalSymbol}`);
+              if (!existing) shouldSave = true; // Save only if no previous value exists
+            } catch (e) {
+              shouldSave = false;
+            }
+          }
+          if (!shouldSave) return;
 
           // Twelve Data timestamp is Unix seconds, convert to ms
           const ts = data.timestamp ? data.timestamp * 1000 : Date.now();
