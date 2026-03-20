@@ -5,6 +5,7 @@ const { requireAuth } = require('../middleware/auth');
 const { getDb } = require('../db');
 const { validateRegister, validateLogin } = require('../middleware/validate');
 const { generateAccessToken, generateRefreshToken, hashToken } = require('../utils/tokens');
+const nodemailer = require('nodemailer');
 
 const router = express.Router();
 const NODE_ENV = process.env.NODE_ENV;
@@ -21,6 +22,17 @@ function setRefreshCookie(res, token, maxAgeSeconds) {
   };
   res.cookie('refresh_token', token, cookieOptions);
 }
+
+// Configure nodemailer transporter
+const transporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  port: parseInt(process.env.SMTP_PORT || '587', 10),
+  secure: process.env.SMTP_SECURE === 'true', // true for 465, false for other ports
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS
+  }
+});
 
 router.post('/register', validateRegister, async (req, res) => {
   try {
@@ -304,8 +316,22 @@ router.post('/forgot-password', async (req, res) => {
   const code = (Math.floor(100000 + Math.random() * 900000)).toString();
   resetCodes.set(email, { code, expires: Date.now() + 15 * 60 * 1000 }); // 15 min expiry
 
-  // TODO: send code via email
+  // Development-only testing
   if (NODE_ENV !== 'production') console.log(`[DEV] Password reset code for ${email}: ${code}`);
+  
+  // Send code via email using nodemailer
+  try {
+    await transporter.sendMail({
+      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+      to: email,
+      subject: 'Your Voltrix Password Recovery Code',
+      text: `Your password recovery code is: ${code}\n\nThis code will expire in 15 minutes.`,
+      html: `<p>Your password recovery code is: <b>${code}</b></p><p>This code will expire in 15 minutes.</p>`
+    });
+  } catch (err) {
+    console.error('Failed to send recovery email:', err);
+    return res.status(500).json({ error: 'Failed to send recovery email' });
+  }
 
   res.json({ ok: true });
 });
