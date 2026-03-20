@@ -18,7 +18,7 @@ async function handleTick(tick) {
   // For long positions (side=buy): SL triggers when market price <= stop_loss; TP triggers when market price >= take_profit
   // For short positions (side=sell): SL triggers when market price >= stop_loss; TP triggers when market price <= take_profit
   const q = `
-    SELECT id, user_id, side, size, stop_loss_cents, take_profit_cents
+    SELECT id, user_id, side, size, placed_price_cents, stop_loss_cents, take_profit_cents
     FROM positions
     WHERE symbol=$1 AND status='open' AND (stop_loss_cents IS NOT NULL OR take_profit_cents IS NOT NULL)
   `;
@@ -33,18 +33,20 @@ async function handleTick(tick) {
 
     for (const o of rows) {
     try {
+      const placedPrice = o.placed_price_cents ? Number(o.placed_price_cents) : null;
       const sl = o.stop_loss_cents ? Number(o.stop_loss_cents) : null;
       const tp = o.take_profit_cents ? Number(o.take_profit_cents) : null;
+      
       let triggered = null; // 'sl' or 'tp'
 
       if (o.side === 'buy') {
         // for buy positions, check the bid price (what we'd get when selling)
-        if (sl !== null && rawBid <= sl) triggered = 'sl';
-        if (tp !== null && rawBid >= tp) triggered = 'tp';
+        if (sl !== null && rawBid <= (placedPrice - sl)) triggered = 'sl';
+        if (tp !== null && rawBid >= (placedPrice + tp)) triggered = 'tp';
       } else {
         // for sell positions, check the ask price (what we'd pay to buy back)
-        if (sl !== null && rawAsk >= sl) triggered = 'sl';
-        if (tp !== null && rawAsk <= tp) triggered = 'tp';
+        if (sl !== null && rawAsk >= (placedPrice + sl)) triggered = 'sl';
+        if (tp !== null && rawAsk <= (placedPrice - tp)) triggered = 'tp';
       }
 
       if (!triggered) continue;
