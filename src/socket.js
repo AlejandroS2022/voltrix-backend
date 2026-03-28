@@ -27,8 +27,21 @@ function setupSocket(httpServer) {
     if (socket.user && socket.user.userId) {
       try { socket.join(`user:${socket.user.userId}`); } catch (e) {}
     }
-    socket.on('subscribe', (symbol) => {
-      if (symbol) socket.join(`asset:${symbol}`);
+    socket.on('subscribe', async (symbol) => {
+      if (symbol) {
+        socket.join(`asset:${symbol}`);
+        // On subscribe, immediately send the latest price for the symbol from Redis if available
+        try {
+          const redis = require('../config/redis');
+          const raw = await redis.get(`tick_latest:${symbol}`);
+          if (raw) {
+            const tick = JSON.parse(raw);
+            socket.emit('price', tick);
+          }
+        } catch (e) {
+          console.warn('Failed to send latest price on subscribe for', symbol, e);
+        }
+      }
     });
     socket.on('unsubscribe', (symbol) => {
       if (symbol) socket.leave(`asset:${symbol}`);

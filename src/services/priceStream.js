@@ -29,7 +29,39 @@ async function getFeeForSymbol(symbol) {
 }
 
 function startPriceStream() {
-  subscriber.on('connect', () => console.log('Price subscriber connected to Redis'));
+  subscriber.on('connect', async () => {
+    console.log('Price subscriber connected to Redis');
+    // On connect, emit all latest prices from Redis for all symbols
+    try {
+      const keys = await subscriber.keys('tick_latest:*');
+      for (const key of keys) {
+        const raw = await subscriber.get(key);
+        if (!raw) continue;
+        try {
+          const parsed = JSON.parse(raw);
+          // Enrich and broadcast as if it was a fresh tick
+          const fee = await getFeeForSymbol(parsed.symbol);
+          const enriched = Object.assign({}, parsed);
+          if (fee) {
+            enriched.fee_type = fee.fee_type;
+            enriched.fee_value = fee.fee_value;
+            if (fee.fee_type === 'percent') {
+              const pct = parseFloat(fee.fee_value) || 0;
+              enriched.price_with_fee_cents = Math.round(parsed.price_cents * (1 + pct / 100));
+            } else {
+              const fixed = Math.round((parseFloat(fee.fee_value) || 0) * 100);
+              enriched.price_with_fee_cents = parsed.price_cents + fixed;
+            }
+          }
+          broadcastPrice(enriched);
+        } catch (e) {
+          console.warn('Failed to broadcast initial tick for', key, e);
+        }
+      }
+    } catch (e) {
+      console.warn('Failed to emit all initial ticks on connect', e);
+    }
+  });
   subscriber.on('error', (err) => console.error('Price subscriber error', err));
 
   // subscribe to a single channel 'market:prices' - publishers should use this channel

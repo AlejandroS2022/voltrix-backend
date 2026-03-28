@@ -92,7 +92,7 @@ class TwelveDataAdapter extends EventEmitter {
   }
 
   // Start market data websocket and publish ticks to Redis + emit 'tick' events
-  startMarketData(symbols = ['BTC/USD']) {
+  async startMarketData(symbols = ['BTC/USD']) {
     if (!this.enabled) {
       console.log('Twelve Data adapter disabled - no API key configured');
       return;
@@ -101,6 +101,51 @@ class TwelveDataAdapter extends EventEmitter {
     this.marketDataSymbols = symbols;
     this._clearReconnect();
     this._disposeWs();
+
+    // On initialization, fetch last price for all symbols and save to Redis if missing
+    for (const symbol of symbols) {
+      const internalSymbol = this._toInternalSymbol(symbol);
+      try {
+        const existing = await redis.get(`tick_latest:${internalSymbol}`);
+        if (!existing) {
+          // Fetch from Twelve Data REST API
+          try {
+            const apiKey = this.apiKey;
+            const url = `https://api.twelvedata.com/price?symbol=${encodeURIComponent(symbol)}${apiKey ? `&apikey=${apiKey}` : ''}`;
+            const resp = await axios.get(url, { timeout: 5000 });
+            if (resp.data && resp.data.price) {
+              const priceCents = Math.round(parseFloat(resp.data.price) * 100);
+              const now = Date.now();
+              const tick = {
+                symbol: internalSymbol,
+                td_symbol: symbol,
+                price_cents: priceCents,
+                raw_bid_cents: priceCents,
+                raw_ask_cents: priceCents,
+                bid_cents: priceCents,
+                ask_cents: priceCents,
+                ts: now,
+                fee_applied: false,
+                source: 'twelvedata_rest'
+              };
+              await redis.set(`tick_latest:${internalSymbol}`, JSON.stringify(tick));
+              console.log(`Seeded Redis price for ${internalSymbol} from REST API: ${priceCents / 100}`);
+              // Immediately publish to market:prices so priceStream/socket emits to frontend
+              try {
+                await redis.publish(EMIT_CHANNEL, JSON.stringify(tick));
+                console.log(`Published seeded tick for ${internalSymbol} to market:prices`);
+              } catch (e) {
+                console.warn('Failed to publish seeded tick for', internalSymbol, e);
+              }
+            }
+          } catch (err) {
+            console.warn('Twelve Data REST fallback failed for', symbol, err?.message || err);
+          }
+        }
+      } catch (e) {
+        // ignore
+      }
+    }
 
     // Build subscription message for Twelve Data WebSocket
     // Format: { "action": "subscribe", "params": { "symbols": "AAPL,TRP,QQQ,EUR/USD" } }
