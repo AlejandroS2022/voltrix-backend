@@ -1,5 +1,6 @@
 const { Server } = require('socket.io');
 const jwt = require('jsonwebtoken');
+const redis = require('./config/redis');
 
 let ioInstance = null;
 
@@ -32,7 +33,6 @@ function setupSocket(httpServer) {
         socket.join(`asset:${symbol}`);
         // On subscribe, immediately send the latest price for the symbol from Redis if available
         try {
-          const redis = require('../config/redis');
           const raw = await redis.get(`tick_latest:${symbol}`);
           if (raw) {
             const tick = JSON.parse(raw);
@@ -46,6 +46,29 @@ function setupSocket(httpServer) {
     socket.on('unsubscribe', (symbol) => {
       if (symbol) socket.leave(`asset:${symbol}`);
     });
+
+    // New: allow frontend to request all prices at any time
+    socket.on('get_all_prices', async (cb) => {
+      try {
+        const keys = await redis.keys('tick_latest:*');
+        const prices = {};
+        for (const key of keys) {
+          const raw = await redis.get(key);
+          if (!raw) continue;
+          try {
+            const tick = JSON.parse(raw);
+            prices[tick.symbol] = tick;
+          } catch (e) {}
+        }
+        if (typeof cb === 'function') cb(prices);
+        else socket.emit('all_prices', prices);
+      } catch (e) {
+        console.warn('Failed to get all prices for frontend', e);
+        if (typeof cb === 'function') cb({});
+        else socket.emit('all_prices', {});
+      }
+    });
+
     socket.on('disconnect', () => console.log('client disconnected', socket.id));
   });
 
