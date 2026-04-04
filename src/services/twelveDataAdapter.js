@@ -114,7 +114,7 @@ class TwelveDataAdapter extends EventEmitter {
             const url = `https://api.twelvedata.com/price?symbol=${encodeURIComponent(symbol)}${apiKey ? `&apikey=${apiKey}` : ''}`;
             const resp = await axios.get(url, { timeout: 5000 });
             if (resp.data && resp.data.price) {
-              const priceCents = Math.round(parseFloat(resp.data.price) * 100);
+              const priceCents = parseFloat(resp.data.price) * 100;
               const now = Date.now();
               const tick = {
                 symbol: internalSymbol,
@@ -228,7 +228,7 @@ class TwelveDataAdapter extends EventEmitter {
 
           // Parse price - Twelve Data sends prices as floats
           // No bid/ask available from free tier — synthesize from price
-          const rawPrice = data.price !== undefined && data.price !== null ? Math.round(parseFloat(data.price) * 100) : null;
+          const rawPrice = data.price !== undefined && data.price !== null ? parseFloat(data.price) * 100 : null;
 
           // Only allow saving to Redis if price is present, or if this is the first tick for this symbol
           let shouldSave = false;
@@ -282,14 +282,14 @@ class TwelveDataAdapter extends EventEmitter {
           let adjAsk = rawAsk;
           let adjBid = rawBid;
           if (fee && (rawAsk !== null || rawBid !== null)) {
-            if (fee.fee_type === 'percent') {
+          if (fee.fee_type === "percent") {
               const pct = parseFloat(fee.fee_value) || 0;
-              if (rawAsk !== null) adjAsk = Math.round(rawAsk * (1 + pct / 100));
-              if (rawBid !== null) adjBid = Math.round(rawBid * (1 - pct / 100));
+              adjAsk = rawAsk * (1 + pct / 100);
+              adjBid = rawBid * (1 - pct / 100);
             } else {
-              const fixed = Math.round((parseFloat(fee.fee_value) || 0) * 100);
-              if (rawAsk !== null) adjAsk = rawAsk + fixed;
-              if (rawBid !== null) adjBid = Math.max(0, rawBid - fixed);
+              const fixed = (parseFloat(fee.fee_value) || 0) * 100;
+              adjAsk = rawAsk + fixed;
+              adjBid = Math.max(0, rawBid - fixed);
             }
           }
 
