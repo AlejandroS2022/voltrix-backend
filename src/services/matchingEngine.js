@@ -227,6 +227,7 @@ async function placeOrder({ userId, side, order_type = 'limit', price_cents = nu
         await client.query('ROLLBACK');
         return { error: 'no_price_available' };
       }
+      execPerUnit = Math.round(execPerUnit);
       const res = await openPosition(execPerUnit, execPerUnit);
       if (res.error) return res;
       await client.query('COMMIT');
@@ -369,6 +370,7 @@ async function closePosition({ positionId, closePriceCents = null }) {
     // pos.entry_price_cents is stored as total cost (per-unit_with_fee * size)
     const entryAmount = BigInt(Number(pos.entry_price_cents || 0));
     const sizeNum = Number(pos.size);
+    closePrice = Math.round(closePrice);
     // if tick already has fees applied (broadcasted), don't re-apply
     let closePriceWithFee;
     if (typeof closePrice === 'number' && tickHasFee) {
