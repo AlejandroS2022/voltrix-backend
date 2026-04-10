@@ -37,6 +37,8 @@ class TwelveDataAdapter extends EventEmitter {
     this.reconnectAttempt = 0;
     this.pingInterval = null;
     this.symbolsMap = new Map(); // Map Twelve Data symbols to internal format
+    this.lastUpdateMap = new Map(); // Map td_symbol -> last update timestamp
+    this.pollingInterval = null;
   }
 
   _clearReconnect() {
@@ -50,6 +52,13 @@ class TwelveDataAdapter extends EventEmitter {
     if (this.pingInterval) {
       clearInterval(this.pingInterval);
       this.pingInterval = null;
+    }
+  }
+
+  _clearPolling() {
+    if (this.pollingInterval) {
+      clearInterval(this.pollingInterval);
+      this.pollingInterval = null;
     }
   }
 
@@ -71,6 +80,7 @@ class TwelveDataAdapter extends EventEmitter {
 
   _disposeWs() {
     this._clearPing();
+    this._clearPolling();
     if (this.ws) {
       this.ws.removeAllListeners();
       if (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING) {
@@ -130,6 +140,7 @@ class TwelveDataAdapter extends EventEmitter {
               };
               await redis.set(`tick_latest:${internalSymbol}`, JSON.stringify(tick));
               console.log(`Seeded Redis price for ${internalSymbol} from REST API: ${priceCents / 100}`);
+              this.lastUpdateMap.set(symbol, Date.now());
               // Immediately publish to market:prices so priceStream/socket emits to frontend
               try {
                 await redis.publish(EMIT_CHANNEL, JSON.stringify(tick));
@@ -141,11 +152,18 @@ class TwelveDataAdapter extends EventEmitter {
           } catch (err) {
             console.warn('Twelve Data REST fallback failed for', symbol, err?.message || err);
           }
+        } else {
+          // Data was present in redis, mark updated now to prevent instant poll
+          this.lastUpdateMap.set(symbol, Date.now());
         }
       } catch (e) {
         // ignore
       }
     }
+
+    // Start fallback polling interval
+    this._clearPolling();
+    this.pollingInterval = setInterval(() => this._pollStaleSymbols(), 30000); // Check every 30s
 
     // Build subscription message for Twelve Data WebSocket
     // Format: { "action": "subscribe", "params": { "symbols": "AAPL,TRP,QQQ,EUR/USD" } }
@@ -161,7 +179,7 @@ class TwelveDataAdapter extends EventEmitter {
     this.ws.on('open', () => {
       this.reconnectAttempt = 0;
       console.log('Twelve Data market websocket connected');
-      
+
       // Subscribe to symbols
       this.ws.send(JSON.stringify(subscribeMsg));
       console.log('Twelve Data: sent subscribe for', symbols);
@@ -190,7 +208,7 @@ class TwelveDataAdapter extends EventEmitter {
       (async () => {
         try {
           const data = JSON.parse(msg);
-          
+
           // Handle subscription status response
           if (data.event === 'subscribe-status') {
             if (data.status === 'error') {
@@ -224,6 +242,7 @@ class TwelveDataAdapter extends EventEmitter {
           const symbol = data.symbol;
           if (!symbol) return;
 
+          this.lastUpdateMap.set(symbol, Date.now());
           const internalSymbol = this._toInternalSymbol(symbol);
 
           // Parse price - Twelve Data sends prices as floats
@@ -282,7 +301,7 @@ class TwelveDataAdapter extends EventEmitter {
           let adjAsk = rawAsk;
           let adjBid = rawBid;
           if (fee && (rawAsk !== null || rawBid !== null)) {
-          if (fee.fee_type === "percent") {
+            if (fee.fee_type === "percent") {
               const pct = parseFloat(fee.fee_value) || 0;
               adjAsk = rawAsk * (1 + pct / 100);
               adjBid = rawBid * (1 - pct / 100);
@@ -309,7 +328,7 @@ class TwelveDataAdapter extends EventEmitter {
 
           try { redis.publish(EMIT_CHANNEL, JSON.stringify(tick)); } catch (e) { /* ignore */ }
           try { redis.set(`tick_latest:${internalSymbol}`, JSON.stringify(tick)); } catch (e) { /* ignore */ }
-          
+
           // Emit locally
           this.emit('tick', tick);
         } catch (err) {
@@ -317,6 +336,99 @@ class TwelveDataAdapter extends EventEmitter {
         }
       })();
     });
+  }
+
+  async _pollStaleSymbols() {
+    if (!this.enabled || !this.marketDataSymbols.length) return;
+    
+    const now = Date.now();
+    const STALE_THRESHOLD_MS = 60000; // 60 seconds
+    const staleSymbols = [];
+
+    for (const symbol of this.marketDataSymbols) {
+      const lastUs = this.lastUpdateMap.get(symbol) || 0;
+      if (now - lastUs > STALE_THRESHOLD_MS) {
+        staleSymbols.push(symbol);
+      }
+    }
+
+    if (staleSymbols.length === 0) return;
+    // To prevent API spam, grab up to 50 stale symbols at a time
+    const batchTargets = staleSymbols.slice(0, 50);
+
+    const BATCH_SIZE = 10;
+    for (let i = 0; i < batchTargets.length; i += BATCH_SIZE) {
+      const batch = batchTargets.slice(i, i + BATCH_SIZE);
+      try {
+        const url = `https://api.twelvedata.com/price?symbol=${encodeURIComponent(batch.join(','))}${this.apiKey ? `&apikey=${this.apiKey}` : ''}`;
+        const resp = await axios.get(url, { timeout: 10000 });
+        
+        if (resp.data) {
+          const processPriceUpdate = async (tdSymbol, priceObj) => {
+            if (!priceObj || !priceObj.price) return;
+            const priceCents = parseFloat(priceObj.price) * 100;
+            const internalSymbol = this._toInternalSymbol(tdSymbol);
+            this.lastUpdateMap.set(tdSymbol, Date.now());
+
+            let fee = null;
+            try {
+              const db = getDb();
+              const fq = await db.query('SELECT fee_type, fee_value FROM symbol_fees WHERE symbol=$1 LIMIT 1', [internalSymbol]);
+              if (fq.rowCount) fee = fq.rows[0];
+            } catch (e) {
+              console.warn('failed to load symbol fee for broadcast', internalSymbol, e);
+            }
+
+            let adjAsk = priceCents;
+            let adjBid = priceCents;
+            if (fee) {
+              if (fee.fee_type === "percent") {
+                const pct = parseFloat(fee.fee_value) || 0;
+                adjAsk = priceCents * (1 + pct / 100);
+                adjBid = priceCents * (1 - pct / 100);
+              } else {
+                const fixed = (parseFloat(fee.fee_value) || 0) * 100;
+                adjAsk = priceCents + fixed;
+                adjBid = Math.max(0, priceCents - fixed);
+              }
+            }
+
+            const tick = {
+              symbol: internalSymbol,
+              td_symbol: tdSymbol,
+              price_cents: priceCents,
+              raw_bid_cents: priceCents,
+              raw_ask_cents: priceCents,
+              bid_cents: adjBid,
+              ask_cents: adjAsk,
+              ts: Date.now(),
+              fee_applied: !!fee,
+              source: 'twelvedata_rest_polling'
+            };
+
+            try { redis.publish(EMIT_CHANNEL, JSON.stringify(tick)); } catch (e) { /* ignore */ }
+            try { redis.set(`tick_latest:${internalSymbol}`, JSON.stringify(tick)); } catch (e) { /* ignore */ }
+            this.emit('tick', tick);
+          };
+
+          if (batch.length === 1) {
+            if (resp.data.price) {
+              await processPriceUpdate(batch[0], resp.data);
+            } else if (resp.data[batch[0]]) {
+              await processPriceUpdate(batch[0], resp.data[batch[0]]);
+            }
+          } else {
+            for (const sym of batch) {
+              if (resp.data[sym]) {
+                await processPriceUpdate(sym, resp.data[sym]);
+              }
+            }
+          }
+        }
+      } catch (err) {
+        console.error('Twelve Data polling error for batch', batch, err?.message || err);
+      }
+    }
   }
 
   // Subscribe to additional symbols
