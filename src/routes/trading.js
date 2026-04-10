@@ -139,19 +139,15 @@ router.post('/withdraw', requireAuth, validateDepositWithdraw, async (req, res) 
       console.error('Error retrieving Stripe account:', acctErr);
     }
 
-    const wallet = await db.query(
-      'SELECT balance_cents FROM wallets WHERE user_id=$1 FOR UPDATE',
-      [req.user.userId]
-    );
-    const balance = parseInt(wallet.rows[0].balance_cents, 10);
-    if (balance < amount_cents) {
+    // debit wallet and create withdrawal row as pending
+    const walletBeforeQ = await db.query('SELECT balance_cents FROM wallets WHERE user_id=$1 FOR UPDATE', [req.user.userId]);
+    const walletBefore = parseInt((walletBeforeQ.rows[0] && walletBeforeQ.rows[0].balance_cents) || 0, 10);
+    
+    if (walletBefore < amount_cents) {
       await db.query('ROLLBACK');
       return res.status(400).json({ error: 'Insufficient funds' });
     }
 
-    // debit wallet and create withdrawal row as pending
-    const walletBeforeQ = await db.query('SELECT balance_cents FROM wallets WHERE user_id=$1 FOR UPDATE', [req.user.userId]);
-    const walletBefore = parseInt((walletBeforeQ.rows[0] && walletBeforeQ.rows[0].balance_cents) || 0, 10);
     const walletAfter = walletBefore - amount_cents;
 
     await db.query('UPDATE wallets SET balance_cents = $1 WHERE user_id=$2', [walletAfter, req.user.userId]);
@@ -173,8 +169,11 @@ router.post('/withdraw', requireAuth, validateDepositWithdraw, async (req, res) 
       reference: String(withdrawalId),
       status: 'pending'
     });
-
-    // Create transfer to connected account
+    
+    // 1) Commit the pending deduction first
+    await db.query('COMMIT');
+    
+    // 2) Now safely execute Stripe processing outside the transaction
     try {
       const transfer = await stripe.transfers.create({
         amount: amount_cents,
@@ -189,16 +188,37 @@ router.post('/withdraw', requireAuth, validateDepositWithdraw, async (req, res) 
       await db.query('UPDATE withdrawals SET status=$1, stripe_transfer_id=$2 WHERE id=$3', ['completed', transfer.id, withdrawalId]);
       await db.query('UPDATE ledger SET status=$1, updated_at=NOW() WHERE id=$2', ['completed', ledgerId]);
     } catch (transferErr) {
-      // If transfer fails, mark as pending - will be processed later
+      // If transfer fails right away, refund the user so they can try again.
       console.error('Transfer creation failed:', transferErr);
-      await db.query('UPDATE withdrawals SET status=$1 WHERE id=$2', ['pending', withdrawalId]);
-      await db.query('UPDATE ledger SET status=$1, updated_at=NOW() WHERE id=$2', ['pending', ledgerId]);
+      await db.query('BEGIN');
+      const refundWalletQ = await db.query('SELECT balance_cents FROM wallets WHERE user_id=$1 FOR UPDATE', [req.user.userId]);
+      const rfBefore = parseInt((refundWalletQ.rows[0] && refundWalletQ.rows[0].balance_cents) || 0, 10);
+      const rfAfter = rfBefore + amount_cents;
+      await db.query('UPDATE wallets SET balance_cents = $1 WHERE user_id=$2', [rfAfter, req.user.userId]);
+      
+      await writeLedger(db, {
+        userId: req.user.userId,
+        related_order_id: null,
+        change_cents: amount_cents,
+        balance_before: rfBefore,
+        balance_after: rfAfter,
+        type: 'refund',
+        meta: { refund_for_withdrawal_id: withdrawalId, reason: 'transfer_failed' },
+        reference: `ref_${withdrawalId}`,
+        status: 'completed'
+      });
+      
+      await db.query('UPDATE withdrawals SET status=$1 WHERE id=$2', ['failed', withdrawalId]);
+      await db.query('UPDATE ledger SET status=$1, updated_at=NOW() WHERE id=$2', ['failed', ledgerId]);
+      await db.query('COMMIT');
+      
+      return res.status(500).json({ error: 'Transfer failed with connected account' });
     }
-    
-    await db.query('COMMIT');
+
     return res.json({ success: true });
   } catch (err) {
-    await db.query('ROLLBACK');
+    // try rollback if transaction was active
+    try { await db.query('ROLLBACK'); } catch (e) {}
     console.error(err);
     res.status(500).json({ error: 'Withdraw failed' });
   }
