@@ -15,7 +15,7 @@ function setupSocket(httpServer) {
     if (!token) return next(); // allow guest
     try {
       const payload = jwt.verify(token, process.env.JWT_SECRET);
-      socket.user = { userId: payload.userId, email: payload.email };
+      socket.user = { userId: payload.userId, email: payload.email, isAdmin: payload.isAdmin };
     } catch (err) {
       console.warn('socket auth failed, proceeding as guest');
     }
@@ -27,6 +27,13 @@ function setupSocket(httpServer) {
     // Auto-join a private room for authenticated users so server can notify them directly
     if (socket.user && socket.user.userId) {
       try { socket.join(`user:${socket.user.userId}`); } catch (e) {}
+
+      if (socket.user.isAdmin || socket.user.is_admin) {
+        try { 
+          socket.join('admin_room'); 
+          console.log(`Admin ${socket.user.userId} Joined to admin_room`);
+        } catch (e) {}
+      }
     }
     socket.on('subscribe', async (symbol) => {
       if (symbol) {
@@ -103,4 +110,9 @@ function broadcastCandle(candle) {
   ioInstance.to(`asset:${symbol}`).emit('candle', candle);
 }
 
-module.exports = { setupSocket, broadcastTrade, broadcastPrice, broadcastCandle, notifyUser };
+function notifyAdmin(event, payload) {
+  if (!ioInstance) return;
+  ioInstance.to('admin_room').emit(event, payload);
+}
+
+module.exports = { setupSocket, broadcastTrade, broadcastPrice, broadcastCandle, notifyUser, notifyAdmin };

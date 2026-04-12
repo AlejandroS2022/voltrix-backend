@@ -58,7 +58,7 @@ router.post('/register', validateRegister, async (req, res) => {
     await db.query('INSERT INTO wallets (user_id, balance_cents) VALUES ($1, 0) ON CONFLICT DO NOTHING', [user.id]);
 
     // generate tokens
-    const accessToken = generateAccessToken({ userId: user.id, email: user.email });
+    const accessToken = generateAccessToken({ userId: user.id, email: user.email, isAdmin: false });
     const rawRefresh = generateRefreshToken();
     const refreshHash = hashToken(rawRefresh);
     const expiresAt = new Date(Date.now() + REFRESH_TTL_DAYS * 24 * 3600 * 1000);
@@ -90,7 +90,7 @@ router.post('/login', validateLogin, async (req, res) => {
     const ok = await bcrypt.compare(password, user.password_hash);
     if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
 
-    const accessToken = generateAccessToken({ userId: user.id, email: user.email });
+    const accessToken = generateAccessToken({ userId: user.id, email: user.email, isAdmin: user.is_admin });
     const rawRefresh = generateRefreshToken();
     const refreshHash = hashToken(rawRefresh);
     const expiresAt = new Date(Date.now() + REFRESH_TTL_DAYS * 24 * 3600 * 1000);
@@ -138,7 +138,7 @@ router.post('/refresh', async (req, res) => {
 
     const userRes = await db.query('SELECT id,email,first_name,last_name,is_admin FROM users WHERE id=$1', [tokenRow.user_id]);
     const user = userRes.rows[0];
-    const accessToken = generateAccessToken({ userId: user.id, email: user.email });
+    const accessToken = generateAccessToken({ userId: user.id, email: user.email, isAdmin: user.is_admin });
 
     setRefreshCookie(res, newRaw, REFRESH_TTL_DAYS * 24 * 3600);
     res.json({ token: accessToken, user });
