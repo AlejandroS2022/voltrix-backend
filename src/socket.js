@@ -7,7 +7,7 @@ let ioInstance = null;
 function setupSocket(httpServer) {
   const io = new Server(httpServer, { cors: { origin: '*' } });
   ioInstance = io;
-
+  global.io = io;
   // Allow unauthenticated (guest) connections so public price feeds remain available
   // If a token is provided, verify and attach user info; otherwise continue as guest.
   io.use((socket, next) => {

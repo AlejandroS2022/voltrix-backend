@@ -590,10 +590,15 @@ router.delete("/favorites/:symbol", requireAuth, async (req, res) => {
 });
 
 function syncBalance(userId, balance) {
-  const payload = { user_id: userId, balance_cents: balance };
+  const payload = { 
+    user_id: userId, 
+    balance_cents: balance.toString() 
+  };
   notifyAdmin("admin_user_balance_update", payload);
   notifyUser(userId, "wallet_updated", payload);
 }
+
+global.syncBalance = syncBalance; 
 
 router.syncBalance = syncBalance; 
 

@@ -167,7 +167,7 @@ async function placeOrder({ userId, side, order_type = 'limit', price_cents = nu
       // position opened
       // notify the owner that positions changed
       try { notifyUser(userId, 'positions:changed', { positionId: position.id, action: 'open' }); } catch (e) {}
-      return { ok: true, positionId: position.id };
+      return { ok: true, positionId: position.id, balanceAfter: balanceAfter.toString() };
     }
 
     // Decide execution for market orders or immediate limit fills
@@ -230,7 +230,10 @@ async function placeOrder({ userId, side, order_type = 'limit', price_cents = nu
       execPerUnit = Math.round(execPerUnit);
       const res = await openPosition(execPerUnit, execPerUnit);
       if (res.error) return res;
-      await client.query('COMMIT');
+      await client.query('COMMIT');      
+      if (global.syncBalance) {
+        global.syncBalance(userId, res.balanceAfter);
+      }
       return res;
     } else {
       // Limit order: user sets price P. We store P and only activate when market allows us to fill at P after our fee (see pendingActivator).
@@ -273,6 +276,9 @@ async function placeOrder({ userId, side, order_type = 'limit', price_cents = nu
       );
 
       await client.query('COMMIT');
+      if (global.syncBalance) {
+        global.syncBalance(userId, balanceAfter.toString());
+      }
       return { ok: true, pending: true, positionId: position.id };
     }
 
@@ -308,7 +314,6 @@ async function closePosition({ positionId, closePriceCents = null }) {
       const before = BigInt(wq.rows[0]?.balance_cents || 0);
       const after = before + entryAmount;
       await client.query('UPDATE wallets SET balance_cents=$1 WHERE user_id=$2', [after.toString(), pos.user_id]);
-
       await client.query(
         `INSERT INTO ledger (user_id, related_order_id, change_cents, balance_before, balance_after, type, meta)
          VALUES ($1,$2,$3,$4,$5,$6,$7)`,
@@ -317,6 +322,9 @@ async function closePosition({ positionId, closePriceCents = null }) {
 
       await client.query('UPDATE positions SET status=$1, closed_at=NOW() WHERE id=$2', ['cancelled', pos.id]);
       await client.query('COMMIT');
+      if (global.syncBalance) {
+        global.syncBalance(pos.user_id, after.toString());
+      }
       return { ok: true, positionId: pos.id, status: 'cancelled' };
     }
 
@@ -408,6 +416,9 @@ async function closePosition({ positionId, closePriceCents = null }) {
     );
 
     await client.query('COMMIT');
+    if (global.syncBalance) {
+      global.syncBalance(pos.user_id, after.toString());
+    }
     try { notifyUser(pos.user_id, 'positions:changed', { positionId: pos.id, action: 'close', pnl: Number(pnl) }); } catch (e) {}
     return { ok: true, positionId: pos.id, pnl: Number(pnl) };
   } catch (err) {
