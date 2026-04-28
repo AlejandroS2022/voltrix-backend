@@ -149,24 +149,34 @@ router.get("/all-positions", requireAuth, requireAdmin, async (req, res) => {
       100,
     );
     const offset = (page - 1) * pageSize;
+    const targetUserId = req.query.user_id;
 
-    const totalRes = await db.query(
-      `SELECT COUNT(1) AS total
-         FROM positions p
-         JOIN users u ON p.user_id = u.id
-         WHERE p.status = 'open'`,
-    );
+    const queryParams = [];
+    let queryWhere = `WHERE p.status = 'open'`;
+    
+    if (targetUserId) {
+      queryParams.push(targetUserId);
+      queryWhere += ` AND p.user_id = $1`;
+    }
+
+    const countQuery = `SELECT COUNT(1) AS total FROM positions p JOIN users u ON p.user_id = u.id ${queryWhere}`;
+    const totalRes = await db.query(countQuery, queryParams);
     const total = parseInt(totalRes.rows[0].total, 10) || 0;
 
-    const q = await db.query(
-      `SELECT p.id, p.user_id, u.email, p.symbol, p.side, p.size, p.entry_price_cents, p.placed_price_cents, p.order_type, p.stop_loss_cents, p.take_profit_cents, p.status, p.realized_pnl_cents, p.created_at, p.closed_at, p.close_price_cents
-         FROM positions p
-         JOIN users u ON p.user_id = u.id
-         WHERE p.status = 'open'
-         ORDER BY p.created_at DESC
-         LIMIT $1 OFFSET $2`,
-      [pageSize, offset],
-    );
+    const limitOffsetIndex = queryParams.length;
+    const dataParams = [...queryParams, pageSize, offset];
+
+    const dataQuery = `
+      SELECT p.id, p.user_id, u.email, p.symbol, p.side, p.size, p.entry_price_cents, p.placed_price_cents, p.order_type, p.stop_loss_cents, p.take_profit_cents, p.status, p.realized_pnl_cents, p.created_at, p.closed_at, p.close_price_cents
+      FROM positions p
+      JOIN users u ON p.user_id = u.id
+      ${queryWhere}
+      ORDER BY p.created_at DESC
+      LIMIT $${limitOffsetIndex + 1} OFFSET $${limitOffsetIndex + 2}
+    `;
+
+    const q = await db.query(dataQuery, dataParams);
+    
     res.json({
       page,
       page_size: pageSize,
