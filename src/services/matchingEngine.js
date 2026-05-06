@@ -387,8 +387,20 @@ async function closePosition({ positionId, closePriceCents = null }) {
       const closeDirection = pos.side === 'buy' ? 'sell' : 'buy';
       closePriceWithFee = await applyFeeToPrice(Number(closePrice), pos.symbol, client, closeDirection);
     }
-    const closeAmount = BigInt(Math.ceil(closePriceWithFee * sizeNum));
-    const pnl = closeAmount - entryAmount;
+    
+    const closeValue = BigInt(Math.ceil(closePriceWithFee * sizeNum));
+    let pnl;
+    let closeAmount;
+
+    if (pos.side === 'buy') {
+      // Long position: Profit when closeValue > entryAmount
+      pnl = closeValue - entryAmount;
+      closeAmount = closeValue; // Equivalent to entryAmount + pnl
+    } else {
+      // Short position: Profit when closeValue < entryAmount
+      pnl = entryAmount - closeValue;
+      closeAmount = entryAmount + pnl; // Returns original margin + PnL
+    }
 
     // credit user wallet with closeAmount
     const wq = await client.query('SELECT balance_cents FROM wallets WHERE user_id=$1 FOR UPDATE', [pos.user_id]);
