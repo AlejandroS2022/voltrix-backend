@@ -32,7 +32,7 @@ function setupSecurity(app) {
   const client = redis;
   const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,  // 15 minutes
-    max: 150,
+    max: 900,
     standardHeaders: true,
     legacyHeaders: false,
     store: new RedisStore({
