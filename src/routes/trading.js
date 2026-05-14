@@ -404,38 +404,41 @@ router.get("/transactions", requireAuth, async (req, res) => {
     const offset = (page - 1) * pageSize;
 
     const filters = [req.user.userId];
-    let where = "WHERE user_id=$1";
+    let where = "WHERE l.user_id=$1";
     let idx = 2;
     if (req.query.type) {
-      where += ` AND type = $${idx}`;
+      where += ` AND l.type = $${idx}`;
       filters.push(req.query.type);
       idx++;
     }
     if (req.query.status) {
-      where += ` AND status = $${idx}`;
+      where += ` AND l.status = $${idx}`;
       filters.push(req.query.status);
       idx++;
     }
     if (req.query.start_date) {
-      where += ` AND created_at >= $${idx}`;
+      where += ` AND l.created_at >= $${idx}`;
       filters.push(req.query.start_date);
       idx++;
     }
     if (req.query.end_date) {
-      where += ` AND created_at <= $${idx}`;
+      where += ` AND l.created_at <= $${idx}`;
       filters.push(req.query.end_date);
       idx++;
     }
 
     const totalRes = await db.query(
-      `SELECT COUNT(1) AS total FROM ledger ${where}`,
+      `SELECT COUNT(1) AS total FROM ledger l ${where}`,
       filters,
     );
     const total = parseInt(totalRes.rows[0].total, 10) || 0;
 
     const q = await db.query(
-      `SELECT id, reference AS ref, created_at, type AS display_type, change_cents AS amount_cents, status, meta
-        FROM ledger ${where} ORDER BY created_at DESC LIMIT $${idx} OFFSET $${idx + 1}`,
+      `SELECT l.id, l.reference AS ref, l.created_at, l.type AS display_type, l.change_cents AS amount_cents, l.status, l.meta,
+              p.side AS pos_side, p.order_type as pos_order_type, p.size AS pos_size, p.entry_price_cents AS pos_margin, p.placed_price_cents AS pos_placed_price, p.stop_loss_cents AS pos_sl, p.take_profit_cents AS pos_tp, p.close_price_cents AS pos_close_price, p.symbol AS pos_symbol
+        FROM ledger l
+        LEFT JOIN positions p ON l.type = 'position_close' AND p.id = (l.meta->>'position_id')::integer
+        ${where} ORDER BY l.created_at DESC LIMIT $${idx} OFFSET $${idx + 1}`,
       [...filters, pageSize, offset],
     );
 
@@ -451,6 +454,17 @@ router.get("/transactions", requireAuth, async (req, res) => {
         amount_cents: parseInt(r.amount_cents, 10) || 0,
         status: r.status || null,
         meta: r.meta || null,
+        position_details: r.display_type === 'position_close' ? {
+          side: r.pos_side,
+          order_type: r.pos_order_type,
+          size: r.pos_size,
+          symbol: r.pos_symbol,
+          margin: r.pos_margin,
+          placed_price_cents: r.pos_placed_price,
+          close_price_cents: r.pos_close_price,
+          stop_loss_cents: r.pos_sl,
+          take_profit_cents: r.pos_tp
+        } : null
       })),
     });
   } catch (err) {
