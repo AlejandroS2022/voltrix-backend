@@ -3,6 +3,7 @@ const router = express.Router();
 const { getDb } = require("../db");
 const { requireAuth } = require("../middleware/auth");
 const { invalidateFeeCache } = require("../services/priceStream");
+const redis = require("../config/redis");
 
 const otherRouter = require("./trading");
 const syncBalance = otherRouter.syncBalance;
@@ -269,6 +270,70 @@ router.get("/users", requireAuth, requireAdmin, async (req, res) => {
   } catch (err) {
     console.error("admin users list error", err);
     res.status(500).json({ error: "users_list_failed" });
+  }
+});
+
+router.get("/users/:id/metrics", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const db = getDb();
+    const userId = req.params.id;
+    const wq = await db.query("SELECT balance_cents FROM wallets WHERE user_id=$1", [userId]);
+    const rawBalance = parseInt(wq.rows[0]?.balance_cents || 0, 10);
+
+    const opq = await db.query("SELECT * FROM positions WHERE user_id=$1 AND status='open'", [userId]);
+    
+    let totalMargin = 0;
+    let totalPnl = 0;
+
+    for (const pos of opq.rows) {
+      const margin = parseInt(pos.entry_price_cents || 0, 10);
+      totalMargin += margin;
+
+      try {
+        const sym = String(pos.symbol).toUpperCase();
+        const candidates = [sym];
+        if (sym.endsWith('USDT')) candidates.push(sym.replace(/USDT$/, 'USD'));
+        else if (sym.endsWith('USD')) candidates.push(sym.replace(/USD$/, 'USDT'));
+        
+        let currentPrice = null;
+        for (const s of candidates) {
+          const raw = await redis.get(`tick_latest:${s}`);
+          if (raw) {
+            const tick = JSON.parse(raw);
+            if (tick) {
+              if (pos.side === 'buy' && typeof tick.bid_cents === 'number') currentPrice = tick.bid_cents;
+              else if (pos.side === 'sell' && typeof tick.ask_cents === 'number') currentPrice = tick.ask_cents;
+              if (!currentPrice && typeof tick.price_cents === 'number') currentPrice = tick.price_cents;
+              if (currentPrice) break;
+            }
+          }
+        }
+        
+        if (currentPrice) {
+          const size = Number(pos.size);
+          const closeValue = Math.ceil(currentPrice * size);
+          if (pos.side === 'buy') {
+            totalPnl += (closeValue - margin);
+          } else {
+            totalPnl += (margin - closeValue);
+          }
+        }
+      } catch (e) {}
+    }
+
+    const balance = rawBalance + totalMargin;
+    const equity = balance + totalPnl;
+    const activeFunds = equity - totalMargin;
+
+    res.json({
+      balance_cents: balance,
+      equity_cents: equity,
+      margin_cents: totalMargin,
+      active_funds_cents: activeFunds,
+    });
+  } catch (err) {
+    console.error("admin user metrics error", err);
+    res.status(500).json({ error: "metrics_failed" });
   }
 });
 

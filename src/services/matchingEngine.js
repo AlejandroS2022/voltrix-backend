@@ -144,12 +144,50 @@ async function placeOrder({ userId, side, order_type = 'limit', price_cents = nu
       );
       const position = posRes.rows[0];
 
-      // 2) charge user: deduct total cost from wallet
+      // 2) charge user: deduct total cost from wallet (checking Active Funds)
       const entryAmount = entryCost;
       const wq = await client.query('SELECT balance_cents FROM wallets WHERE user_id=$1 FOR UPDATE', [userId]);
       const balance = BigInt(wq.rows[0]?.balance_cents || 0);
       const cost = BigInt(entryAmount);
-      if (balance < cost) {
+      
+      // Calculate real-time floating PnL
+      const opq = await client.query("SELECT * FROM positions WHERE user_id=$1 AND status='open' AND id != $2", [userId, position.id]);
+      let totalFloatingPnl = 0n;
+      for (const pos of opq.rows) {
+        try {
+          const sym = String(pos.symbol).toUpperCase();
+          const candidates = [sym];
+          if (sym.endsWith('USDT')) candidates.push(sym.replace(/USDT$/, 'USD'));
+          else if (sym.endsWith('USD')) candidates.push(sym.replace(/USD$/, 'USDT'));
+          
+          let currentPrice = null;
+          for (const s of candidates) {
+            const raw = await redis.get(`tick_latest:${s}`);
+            if (raw) {
+              const tick = JSON.parse(raw);
+              if (tick) {
+                if (pos.side === 'buy' && typeof tick.bid_cents === 'number') currentPrice = tick.bid_cents;
+                else if (pos.side === 'sell' && typeof tick.ask_cents === 'number') currentPrice = tick.ask_cents;
+                if (!currentPrice && typeof tick.price_cents === 'number') currentPrice = tick.price_cents;
+                if (currentPrice) break;
+              }
+            }
+          }
+          if (currentPrice) {
+            const posSize = Number(pos.size);
+            const closeValue = BigInt(Math.ceil(currentPrice * posSize));
+            const entryVal = BigInt(Number(pos.entry_price_cents));
+            if (pos.side === 'buy') totalFloatingPnl += (closeValue - entryVal);
+            else totalFloatingPnl += (entryVal - closeValue);
+          }
+        } catch (e) {
+          console.warn('Failed to calculate floating pnl for position', pos.id, e);
+        }
+      }
+
+      const activeFunds = balance + totalFloatingPnl;
+
+      if (activeFunds < cost) {
         // remove created position record
         await client.query('DELETE FROM positions WHERE id=$1', [position.id]);
         await client.query('ROLLBACK');

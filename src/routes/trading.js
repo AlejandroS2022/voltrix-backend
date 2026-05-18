@@ -404,7 +404,7 @@ router.get("/transactions", requireAuth, async (req, res) => {
     const offset = (page - 1) * pageSize;
 
     const filters = [req.user.userId];
-    let where = "WHERE l.user_id=$1";
+    let where = "WHERE l.user_id=$1 AND l.type != 'position_open'";
     let idx = 2;
     if (req.query.type) {
       where += ` AND l.type = $${idx}`;
@@ -434,8 +434,19 @@ router.get("/transactions", requireAuth, async (req, res) => {
     const total = parseInt(totalRes.rows[0].total, 10) || 0;
 
     const q = await db.query(
-      `SELECT l.id, l.reference AS ref, l.created_at, l.type AS display_type, l.change_cents AS amount_cents, l.status, l.meta,
-              p.side AS pos_side, p.order_type as pos_order_type, p.size AS pos_size, p.entry_price_cents AS pos_margin, p.placed_price_cents AS pos_placed_price, p.stop_loss_cents AS pos_sl, p.take_profit_cents AS pos_tp, p.close_price_cents AS pos_close_price, p.symbol AS pos_symbol
+      `SELECT l.id, l.reference AS ref, l.created_at, l.type AS display_type, l.change_cents AS amount_cents, l.status, l.meta, l.balance_before, l.balance_after,
+              l.balance_after + COALESCE((
+                SELECT SUM(entry_price_cents) 
+                FROM positions 
+                WHERE user_id = l.user_id 
+                  AND created_at <= l.created_at 
+                  AND (
+                    (closed_at IS NULL AND status IN ('open', 'pending')) 
+                    OR 
+                    (closed_at IS NOT NULL AND closed_at > l.created_at)
+                  )
+              ), 0) AS true_balance_after,
+              p.side AS pos_side, p.order_type as pos_order_type, p.size AS pos_size, p.entry_price_cents AS pos_margin, p.placed_price_cents AS pos_placed_price, p.stop_loss_cents AS pos_sl, p.take_profit_cents AS pos_tp, p.close_price_cents AS pos_close_price, p.symbol AS pos_symbol, p.realized_pnl_cents AS pos_pnl
         FROM ledger l
         LEFT JOIN positions p ON l.type = 'position_close' AND p.id = (l.meta->>'position_id')::integer
         ${where} ORDER BY l.created_at DESC LIMIT $${idx} OFFSET $${idx + 1}`,
@@ -446,15 +457,20 @@ router.get("/transactions", requireAuth, async (req, res) => {
       page,
       page_size: pageSize,
       total,
-      data: q.rows.map((r) => ({
-        id: r.id,
-        ref: r.ref || String(r.id),
-        date: r.created_at,
-        type: r.display_type,
-        amount_cents: parseInt(r.amount_cents, 10) || 0,
-        status: r.status || null,
-        meta: r.meta || null,
-        position_details: r.display_type === 'position_close' ? {
+      data: q.rows.map((r) => {
+        const finalAmount = r.display_type === 'position_close' ? parseInt(r.pos_pnl, 10) || 0 : parseInt(r.amount_cents, 10) || 0;
+        const balanceAfter = parseInt(r.true_balance_after, 10) || parseInt(r.balance_after, 10) || 0;
+        return {
+          id: r.id,
+          ref: r.ref || String(r.id),
+          date: r.created_at,
+          type: r.display_type,
+          amount_cents: finalAmount,
+          balance_before_cents: balanceAfter - finalAmount,
+          balance_after_cents: balanceAfter,
+          status: r.status || null,
+          meta: r.meta || null,
+          position_details: r.display_type === 'position_close' ? {
           side: r.pos_side,
           order_type: r.pos_order_type,
           size: r.pos_size,
@@ -465,7 +481,8 @@ router.get("/transactions", requireAuth, async (req, res) => {
           stop_loss_cents: r.pos_sl,
           take_profit_cents: r.pos_tp
         } : null
-      })),
+        };
+      }),
     });
   } catch (err) {
     console.error("transactions list error", err);
