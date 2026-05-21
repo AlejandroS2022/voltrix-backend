@@ -7,6 +7,7 @@ const redis = require("../config/redis");
 
 const otherRouter = require("./trading");
 const syncBalance = otherRouter.syncBalance;
+const { closePosition } = require("../services/matchingEngine");
 
 async function requireAdmin(req, res, next) {
   try {
@@ -190,6 +191,21 @@ router.get("/all-positions", requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
+// Admin force-close: accepts an explicit closePriceCents to trigger TP/SL/custom liquidation
+router.post("/positions/:id/close", requireAuth, requireAdmin, async (req, res) => {
+  const positionId = req.params.id;
+  try {
+    const { close_price_cents } = req.body;
+    const closePriceCents = close_price_cents != null ? Number(close_price_cents) : null;
+    const result = await closePosition({ positionId, closePriceCents });
+    if (result && result.ok) return res.json(result);
+    return res.status(400).json({ error: result.error || "close_failed" });
+  } catch (err) {
+    console.error("admin position force-close error", err);
+    res.status(500).json({ error: "position_close_failed" });
+  }
+});
+
 router.patch("/positions/:id", requireAuth, requireAdmin, async (req, res) => {
   const db = getDb();
   const positionId = req.params.id;
@@ -213,7 +229,9 @@ router.patch("/positions/:id", requireAuth, requireAdmin, async (req, res) => {
   for (const field of allowedFields) {
     if (field in req.body) {
       updates.push(`${field}=$${idx}`);
-      values.push(req.body[field]);
+      let val = req.body[field];
+      if (val === "") val = null;
+      values.push(val);
       idx++;
     }
   }
