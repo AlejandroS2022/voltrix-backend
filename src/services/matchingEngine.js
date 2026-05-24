@@ -57,7 +57,7 @@ async function getInternalTriggerPrice(userPriceCents, symbol, client, side) {
   }
 }
 
-async function placeOrder({ userId, side, order_type = 'limit', price_cents = null, size, stop_loss_cents = null, take_profit_cents = null, symbol = 'BTCUSDT' }) {
+async function placeOrder({ userId, side, order_type = 'limit', price_cents = null, size, leverage = 1, stop_loss_cents = null, take_profit_cents = null, symbol = 'BTCUSDT' }) {
   // size is numeric (units), price_cents is integer for limit orders; market orders have price_cents == null
   const db = getDb();
   const client = await db.connect();
@@ -132,23 +132,25 @@ async function placeOrder({ userId, side, order_type = 'limit', price_cents = nu
       const perUnitWithFee = await applyFeeToPrice(perUnit, symbol, client, side);
       const entryCost = Math.ceil(perUnitWithFee * sizeNum);
 
-      // 1) create position record storing entry_price_cents as total cost
+      // compute required margin based on leverage (default 1)
+      const lev = Number(leverage) || 1;
+      const marginRequired = Math.ceil(entryCost / lev);
+
+      // 1) create position record storing entry_price_cents as total cost and margin/leverage
       const posRes = await client.query(
-        `INSERT INTO positions (user_id, symbol, side, size, entry_price_cents, placed_price_cents, stop_loss_cents, take_profit_cents, order_type, status, created_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'open',NOW()) RETURNING *`,
-        // store entry_price_cents as total cost (per-unit * size)
-        // store placed_price_cents as per-unit price in cents (not multiplied by size)
+        `INSERT INTO positions (user_id, symbol, side, size, entry_price_cents, placed_price_cents, stop_loss_cents, take_profit_cents, order_type, margin_cents, leverage, status, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'open',NOW()) RETURNING *`,
         // store entry_price_cents as total cost (per-unit_with_fee * size)
-        // store placed_price_cents as per-unit executed price including fee
-        [userId, symbol, side, size, entryCost, typeof placedPriceCents === 'number' ? await applyFeeToPrice(placedPriceCents, symbol, client, side) : null, stop_loss_cents, take_profit_cents, order_type]
+        // placed_price_cents as per-unit executed price including fee
+        [userId, symbol, side, size, entryCost, typeof placedPriceCents === 'number' ? await applyFeeToPrice(placedPriceCents, symbol, client, side) : null, stop_loss_cents, take_profit_cents, order_type, marginRequired, lev]
       );
       const position = posRes.rows[0];
 
-      // 2) charge user: deduct total cost from wallet (checking Active Funds)
-      const entryAmount = entryCost;
+      // 2) charge user: deduct required margin from wallet (checking Active Funds)
+      const marginAmount = marginRequired;
       const wq = await client.query('SELECT balance_cents FROM wallets WHERE user_id=$1 FOR UPDATE', [userId]);
       const balance = BigInt(wq.rows[0]?.balance_cents || 0);
-      const cost = BigInt(entryAmount);
+      const cost = BigInt(marginAmount);
       
       // Calculate real-time floating PnL
       const opq = await client.query("SELECT * FROM positions WHERE user_id=$1 AND status='open' AND id != $2", [userId, position.id]);
@@ -199,7 +201,7 @@ async function placeOrder({ userId, side, order_type = 'limit', price_cents = nu
       await client.query(
         `INSERT INTO ledger (user_id, related_order_id, change_cents, balance_before, balance_after, type, meta)
          VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-        [userId, null, -entryAmount, balanceBefore.toString(), balanceAfter.toString(), 'position_open', JSON.stringify({ position_id: position.id, symbol, entry_cost_cents: entryAmount })]
+        [userId, null, -marginAmount, balanceBefore.toString(), balanceAfter.toString(), 'position_open', JSON.stringify({ position_id: position.id, symbol, margin_cents: marginAmount, entry_cost_cents: entryCost })]
       );
 
       // position opened
@@ -286,19 +288,23 @@ async function placeOrder({ userId, side, order_type = 'limit', price_cents = nu
 
       const entryCost = Math.ceil(userPrice * sizeNum);
 
+      // compute required margin based on leverage
+      const lev = Number(leverage) || 1;
+      const marginFreeze = Math.ceil(entryCost / lev);
+      
       // 1) create pending position record
-      // Store user's requested price in placed_price_cents
+      // Store user's requested price in placed_price_cents and margin/leverage
       const pendingRes = await client.query(
-        `INSERT INTO positions (user_id, symbol, side, size, entry_price_cents, placed_price_cents, stop_loss_cents, take_profit_cents, order_type, status, created_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',NOW()) RETURNING *`,
-        [userId, symbol, side, size, entryCost, userPrice, stop_loss_cents, take_profit_cents, order_type]
+        `INSERT INTO positions (user_id, symbol, side, size, entry_price_cents, placed_price_cents, stop_loss_cents, take_profit_cents, order_type, margin_cents, leverage, status, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending',NOW()) RETURNING *`,
+        [userId, symbol, side, size, entryCost, userPrice, stop_loss_cents, take_profit_cents, order_type, marginFreeze, lev]
       );
       const position = pendingRes.rows[0];
-
-      // 2) charge user (freeze funds)
+      
+      // 2) charge user (freeze margin)
       const wq = await client.query('SELECT balance_cents FROM wallets WHERE user_id=$1 FOR UPDATE', [userId]);
       const balance = BigInt(wq.rows[0]?.balance_cents || 0);
-      const cost = BigInt(entryCost);
+      const cost = BigInt(marginFreeze);
       if (balance < cost) {
         await client.query('DELETE FROM positions WHERE id=$1', [position.id]);
         await client.query('ROLLBACK');
@@ -310,7 +316,7 @@ async function placeOrder({ userId, side, order_type = 'limit', price_cents = nu
       await client.query(
         `INSERT INTO ledger (user_id, related_order_id, change_cents, balance_before, balance_after, type, meta)
          VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-        [userId, null, -entryCost, balanceBefore.toString(), balanceAfter.toString(), 'position_hold', JSON.stringify({ position_id: position.id, symbol, entry_cost_cents: entryCost })]
+        [userId, null, -marginFreeze, balanceBefore.toString(), balanceAfter.toString(), 'position_hold', JSON.stringify({ position_id: position.id, symbol, margin_cents: marginFreeze, entry_cost_cents: entryCost })]
       );
 
       await client.query('COMMIT');
@@ -345,19 +351,19 @@ async function closePosition({ positionId, closePriceCents = null }) {
     }
     const pos = pq.rows[0];
 
-    // Handle pending position cancellation (release frozen funds)
+    // Handle pending position cancellation (release frozen margin)
     if (pos.status === 'pending') {
-      const entryAmount = BigInt(Number(pos.entry_price_cents || 0));
+      const marginAmount = BigInt(Number(pos.margin_cents || 0));
       const wq = await client.query('SELECT balance_cents FROM wallets WHERE user_id=$1 FOR UPDATE', [pos.user_id]);
       const before = BigInt(wq.rows[0]?.balance_cents || 0);
-      const after = before + entryAmount;
+      const after = before + marginAmount;
       await client.query('UPDATE wallets SET balance_cents=$1 WHERE user_id=$2', [after.toString(), pos.user_id]);
       await client.query(
         `INSERT INTO ledger (user_id, related_order_id, change_cents, balance_before, balance_after, type, meta)
          VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-        [pos.user_id, null, Number(entryAmount), before.toString(), after.toString(), 'position_release', JSON.stringify({ position_id: pos.id, symbol: pos.symbol, released_cents: Number(entryAmount) })]
+        [pos.user_id, null, Number(marginAmount), before.toString(), after.toString(), 'position_release', JSON.stringify({ position_id: pos.id, symbol: pos.symbol, released_cents: Number(marginAmount) })]
       );
-
+    
       await client.query('UPDATE positions SET status=$1, closed_at=NOW() WHERE id=$2', ['cancelled', pos.id]);
       await client.query('COMMIT');
       if (global.syncBalance) {
@@ -415,6 +421,7 @@ async function closePosition({ positionId, closePriceCents = null }) {
 
     // pos.entry_price_cents is stored as total cost (per-unit_with_fee * size)
     const entryAmount = BigInt(Number(pos.entry_price_cents || 0));
+    const marginAmount = BigInt(Number(pos.margin_cents || 0));
     const sizeNum = Number(pos.size);
     closePrice = Math.round(closePrice);
     // if tick already has fees applied (broadcasted), don't re-apply
@@ -428,30 +435,27 @@ async function closePosition({ positionId, closePriceCents = null }) {
     
     const closeValue = BigInt(Math.ceil(closePriceWithFee * sizeNum));
     let pnl;
-    let closeAmount;
 
     if (pos.side === 'buy') {
       // Long position: Profit when closeValue > entryAmount
       pnl = closeValue - entryAmount;
-      closeAmount = closeValue; // Equivalent to entryAmount + pnl
     } else {
       // Short position: Profit when closeValue < entryAmount
       pnl = entryAmount - closeValue;
-      closeAmount = entryAmount + pnl; // Returns original margin + PnL
     }
 
-    // credit user wallet with closeAmount
+    // credit user wallet with margin + pnl
+    const creditAmount = marginAmount + pnl;
     const wq = await client.query('SELECT balance_cents FROM wallets WHERE user_id=$1 FOR UPDATE', [pos.user_id]);
     const before = BigInt(wq.rows[0]?.balance_cents || 0);
-    const after = before + closeAmount;
+    const after = before + creditAmount;
     await client.query('UPDATE wallets SET balance_cents=$1 WHERE user_id=$2', [after.toString(), pos.user_id]);
 
-    // ledger entry
+    // ledger entry - record margin release + pnl
     await client.query(
       `INSERT INTO ledger (user_id, related_order_id, change_cents, balance_before, balance_after, type, meta)
        VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      // record close_amount (total credited) and meta with per-unit close price including fee
-      [pos.user_id, null, Number(closeAmount), before.toString(), after.toString(), 'position_close', JSON.stringify({ position_id: pos.id, close_price_cents: closePriceWithFee })]
+      [pos.user_id, null, Number(creditAmount), before.toString(), after.toString(), 'position_close', JSON.stringify({ position_id: pos.id, close_price_cents: closePriceWithFee, margin_cents: Number(marginAmount) })]
     );
 
     // update position
@@ -537,13 +541,14 @@ async function activatePendingPosition({ positionId, marketPriceCents }) {
 
     // pos.entry_price_cents stored as total cost for pending positions as well
     const storedEntry = Number(pos.entry_price_cents || 0);
+    const storedMargin = Number(pos.margin_cents || 0);
     const perUnitEntry = storedEntry && Number(pos.size) ? storedEntry / Number(pos.size) : Number(pos.entry_price_cents || 0);
     if (!execPrice) {
       execPrice = perUnitEntry;
       execPriceIsFeeAdjusted = true; // stored entry came from DB and already includes fees
     }
     const sizeNum = Number(pos.size);
-    // compute fee-inclusive per-unit and total entry amount
+    // compute fee-inclusive per-unit and total entry amount (notional)
     let execPriceWithFee;
     if (pos.order_type === 'limit') {
       // For limit orders, user pays their requested price (stored in placed_price_cents)
@@ -553,10 +558,14 @@ async function activatePendingPosition({ positionId, marketPriceCents }) {
     }
     const entryAmount = BigInt(Math.ceil(execPriceWithFee * sizeNum));
 
-    // Funds were already frozen during placeOrder for limit orders.
-    // For limit orders, entryAmount should match storedEntry (userPrice * size), so diff will be 0.
-    const frozenAmount = BigInt(storedEntry);
-    const diff = frozenAmount - entryAmount;
+    // compute required margin based on leverage stored on position (fallback to 1)
+    const lev = Number(pos.leverage) || 1;
+    const requiredMargin = Math.ceil(Number(entryAmount) / lev);
+
+    // Funds were already frozen during placeOrder for limit orders (storedMargin).
+    // Compare frozen margin with requiredMargin and adjust wallet if necessary.
+    const frozenAmount = BigInt(storedMargin);
+    const diff = frozenAmount - BigInt(requiredMargin);
 
     if (diff !== 0n) {
       const wq = await client.query('SELECT balance_cents FROM wallets WHERE user_id=$1 FOR UPDATE', [pos.user_id]);
@@ -571,9 +580,9 @@ async function activatePendingPosition({ positionId, marketPriceCents }) {
       );
     }
 
-    // update position to open and set actual entry price (store total cost)
+    // update position to open and set actual entry price (store total cost) and updated margin
     // also set placed_price_cents to the per-unit execution price (fee-inclusive)
-    await client.query('UPDATE positions SET status=$1, entry_price_cents=$2, placed_price_cents=$3, created_at=NOW() WHERE id=$4', ['open', Number(entryAmount), execPriceWithFee, pos.id]);
+    await client.query('UPDATE positions SET status=$1, entry_price_cents=$2, placed_price_cents=$3, margin_cents=$4, created_at=NOW() WHERE id=$5', ['open', Number(entryAmount), execPriceWithFee, requiredMargin, pos.id]);
 
     // record a trade for the open (no counterparty)
     await client.query(

@@ -94,7 +94,7 @@ async function migrate() {
     END IF;
   END$$;
 
-  -- ensure positions have order_type, stop_loss, take_profit columns
+  -- ensure positions have order_type, stop_loss, take_profit, margin and leverage columns
   DO $$
   BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='positions' AND column_name='order_type') THEN
@@ -109,6 +109,14 @@ async function migrate() {
     -- ensure we store the market price at placement time
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='positions' AND column_name='placed_price_cents') THEN
       ALTER TABLE positions ADD COLUMN placed_price_cents BIGINT;
+    END IF;
+    -- add margin column (amount of user funds reserved for this position)
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='positions' AND column_name='margin_cents') THEN
+      ALTER TABLE positions ADD COLUMN margin_cents BIGINT;
+    END IF;
+    -- add leverage column (numeric, default 1)
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='positions' AND column_name='leverage') THEN
+      ALTER TABLE positions ADD COLUMN leverage NUMERIC DEFAULT 1;
     END IF;
     -- remove broker_order_id and index if present (we no longer place orders on broker)
     IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='positions' AND column_name='broker_order_id') THEN

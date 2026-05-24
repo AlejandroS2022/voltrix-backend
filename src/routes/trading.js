@@ -319,6 +319,7 @@ router.post("/positions", requireAuth, validateOrder, async (req, res) => {
       order_type,
       price_cents,
       size,
+      leverage,
       stop_loss_cents,
       take_profit_cents,
       symbol,
@@ -333,6 +334,7 @@ router.post("/positions", requireAuth, validateOrder, async (req, res) => {
       order_type,
       price_cents,
       size,
+      leverage,
       stop_loss_cents,
       take_profit_cents,
       symbol,
@@ -348,20 +350,20 @@ router.post("/positions", requireAuth, validateOrder, async (req, res) => {
 });
 
 // List open positions for the current user
-router.get("/positions", requireAuth, async (req, res) => {
-  const db = getDb();
-  try {
-    const q = await db.query(
-      `SELECT id, symbol, side, size, entry_price_cents, placed_price_cents, order_type, stop_loss_cents, take_profit_cents, status, realized_pnl_cents, created_at, closed_at, close_price_cents
-         FROM positions WHERE user_id=$1 ORDER BY created_at DESC`,
-      [req.user.userId],
-    );
-    res.json(q.rows);
-  } catch (err) {
-    console.error("positions list error", err);
-    res.status(500).json({ error: "positions_list_failed" });
-  }
-});
+    router.get("/positions", requireAuth, async (req, res) => {
+      const db = getDb();
+      try {
+        const q = await db.query(
+          `SELECT id, symbol, side, size, entry_price_cents, placed_price_cents, order_type, stop_loss_cents, take_profit_cents, margin_cents, leverage, status, realized_pnl_cents, created_at, closed_at, close_price_cents
+             FROM positions WHERE user_id=$1 ORDER BY created_at DESC`,
+          [req.user.userId],
+        );
+        res.json(q.rows);
+      } catch (err) {
+        console.error("positions list error", err);
+        res.status(500).json({ error: "positions_list_failed" });
+      }
+    });
 
 // Close a position (manual market close)
 router.post("/positions/:id/close", requireAuth, async (req, res) => {
@@ -433,10 +435,10 @@ router.get("/transactions", requireAuth, async (req, res) => {
     );
     const total = parseInt(totalRes.rows[0].total, 10) || 0;
 
-    const q = await db.query(
-      `SELECT l.id, l.reference AS ref, l.created_at, l.type AS display_type, l.change_cents AS amount_cents, l.status, l.meta, l.balance_before, l.balance_after,
+      const q = await db.query(
+        `SELECT l.id, l.reference AS ref, l.created_at, l.type AS display_type, l.change_cents AS amount_cents, l.status, l.meta, l.balance_before, l.balance_after,
               l.balance_after + COALESCE((
-                SELECT SUM(entry_price_cents) 
+                SELECT SUM(margin_cents) 
                 FROM positions 
                 WHERE user_id = l.user_id 
                   AND created_at <= l.created_at 
@@ -446,12 +448,12 @@ router.get("/transactions", requireAuth, async (req, res) => {
                     (closed_at IS NOT NULL AND closed_at > l.created_at)
                   )
               ), 0) AS true_balance_after,
-              p.side AS pos_side, p.order_type as pos_order_type, p.size AS pos_size, p.entry_price_cents AS pos_margin, p.placed_price_cents AS pos_placed_price, p.stop_loss_cents AS pos_sl, p.take_profit_cents AS pos_tp, p.close_price_cents AS pos_close_price, p.symbol AS pos_symbol, p.realized_pnl_cents AS pos_pnl
+              p.side AS pos_side, p.order_type as pos_order_type, p.size AS pos_size, p.margin_cents AS pos_margin, p.placed_price_cents AS pos_placed_price, p.stop_loss_cents AS pos_sl, p.take_profit_cents AS pos_tp, p.close_price_cents AS pos_close_price, p.symbol AS pos_symbol, p.realized_pnl_cents AS pos_pnl, p.leverage AS pos_leverage
         FROM ledger l
         LEFT JOIN positions p ON l.type = 'position_close' AND p.id = (l.meta->>'position_id')::integer
         ${where} ORDER BY l.created_at DESC LIMIT $${idx} OFFSET $${idx + 1}`,
-      [...filters, pageSize, offset],
-    );
+        [...filters, pageSize, offset],
+      );
 
     res.json({
       page,

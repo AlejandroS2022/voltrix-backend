@@ -304,9 +304,9 @@ router.get("/users/:id/metrics", requireAuth, requireAdmin, async (req, res) => 
     let totalPnl = 0;
 
     for (const pos of opq.rows) {
-      const margin = parseInt(pos.entry_price_cents || 0, 10);
+      const margin = parseInt(pos.margin_cents || 0, 10);
       totalMargin += margin;
-
+      
       try {
         const sym = String(pos.symbol).toUpperCase();
         const candidates = [sym];
@@ -330,10 +330,11 @@ router.get("/users/:id/metrics", requireAuth, requireAdmin, async (req, res) => 
         if (currentPrice) {
           const size = Number(pos.size);
           const closeValue = Math.ceil(currentPrice * size);
+          const entryAmount = parseInt(pos.entry_price_cents || 0, 10);
           if (pos.side === 'buy') {
-            totalPnl += (closeValue - margin);
+            totalPnl += (closeValue - entryAmount);
           } else {
-            totalPnl += (margin - closeValue);
+            totalPnl += (entryAmount - closeValue);
           }
         }
       } catch (e) {}
