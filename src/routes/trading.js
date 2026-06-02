@@ -478,6 +478,7 @@ router.get("/transactions", requireAuth, async (req, res) => {
           size: r.pos_size,
           symbol: r.pos_symbol,
           margin: r.pos_margin,
+          leverage: r.pos_leverage,
           placed_price_cents: r.pos_placed_price,
           close_price_cents: r.pos_close_price,
           stop_loss_cents: r.pos_sl,
